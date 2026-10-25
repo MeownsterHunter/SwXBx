@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/swxbx"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0 OR AGPL-3.0-or-later"

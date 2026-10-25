@@ -1,0 +1,8 @@
+target/
+Cargo.lock.bak
+*.swp
+
+# Output of the C host example
+examples/c-host/census.txt
+examples/c-host/shapes.txt
+examples/c-host/frame.ppm

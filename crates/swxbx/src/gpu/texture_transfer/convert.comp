@@ -1,0 +1,131 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint values[];
+};
+
+layout(push_constant, std430) uniform Parameters {
+    uint64_t tiled_address;
+    uint64_t linear_address;
+    uint64_t row_bytes;
+    uint64_t tiled_size;
+    uint64_t linear_size;
+    uint64_t tile_columns;
+    uint rows;
+    uint depth;
+    uint height_log2;
+    uint depth_log2;
+    uint load;
+    uint padding;
+    uint64_t word_base;
+} p;
+
+uint read_byte(uint64_t address) {
+    uint64_t aligned = address & ~uint64_t(3);
+    return (Words(aligned).values[0] >> (uint(address & 3) * 8)) & 255;
+}
+
+uint64_t quotient(uint64_t value, uint64_t divisor) {
+    if ((divisor & (divisor - 1)) == 0) {
+        int bit = divisor > uint64_t(0xffffffffu)
+            ? 32 + findMSB(uint(divisor >> 32)) : findMSB(uint(divisor));
+        return value >> bit;
+    }
+    return value / divisor;
+}
+
+uint64_t remainder(uint64_t value, uint64_t divisor) {
+    if ((divisor & (divisor - 1)) == 0)
+        return value & (divisor - 1);
+    return value % divisor;
+}
+
+uint64_t tiled_offset(uint64_t x, uint y, uint z) {
+    uint64_t tile_rows = (uint64_t(p.rows) + (uint64_t(8) << p.height_log2) - 1)
+        >> (3 + p.height_log2);
+    uint64_t tile = ((uint64_t(z >> p.depth_log2) * tile_rows
+        + (y >> (3 + p.height_log2))) * p.tile_columns) + x / 64;
+    uint gob = ((z & ((1u << p.depth_log2) - 1)) << p.height_log2)
+        | ((y >> 3) & ((1u << p.height_log2) - 1));
+    uint ix = uint(x & 63);
+    uint iy = y & 7;
+    uint sector = (ix / 32) * 256 + (iy / 2) * 64
+        + ((ix % 32) / 16) * 32 + (iy % 2) * 16 + ix % 16;
+    return (tile << (9 + p.height_log2 + p.depth_log2))
+        + uint64_t(gob) * 512 + sector;
+}
+
+void untile_coordinate(uint64_t at, out uint64_t x, out uint y, out uint z) {
+    uint64_t tile_rows = (uint64_t(p.rows) + (uint64_t(8) << p.height_log2) - 1)
+        >> (3 + p.height_log2);
+    uint64_t tile = at >> (9 + p.height_log2 + p.depth_log2);
+    uint64_t column = remainder(tile, p.tile_columns);
+    uint64_t row = remainder(quotient(tile, p.tile_columns), tile_rows);
+    uint64_t plane = quotient(tile, p.tile_columns * tile_rows);
+    uint64_t gob = (at >> 9) & ((uint64_t(1) << (p.height_log2 + p.depth_log2)) - 1);
+    uint sector = uint(at & 511);
+    x = column * 64 + ((sector >> 8) & 1) * 32
+        + ((sector >> 5) & 1) * 16 + (sector & 15);
+    y = uint(row * (uint64_t(8) << p.height_log2))
+        + uint(gob & ((uint64_t(1) << p.height_log2) - 1)) * 8
+        + ((sector >> 6) & 3) * 2 + ((sector >> 4) & 1);
+    z = uint(plane << p.depth_log2) + uint(gob >> p.height_log2);
+}
+
+void main() {
+    uint64_t byte_at = (p.word_base + uint64_t(gl_GlobalInvocationID.x)) * 4;
+    uint64_t output_size = p.load != 0 ? p.linear_size : p.tiled_size;
+    if (byte_at >= output_size)
+        return;
+    uint64_t output_address = (p.load != 0 ? p.linear_address : p.tiled_address) + byte_at;
+    uint64_t used_linear = p.row_bytes * uint64_t(p.rows) * uint64_t(p.depth);
+    uint64_t tiled_x = 0;
+    uint tiled_y = 0;
+    uint tiled_z = 0;
+    if (p.load != 0 && byte_at + 4 <= used_linear) {
+        uint64_t x = remainder(byte_at, p.row_bytes);
+        if ((x & 3) == 0 && x + 4 <= p.row_bytes) {
+            uint64_t row = quotient(byte_at, p.row_bytes);
+            uint y = uint(remainder(row, uint64_t(p.rows)));
+            uint z = uint(quotient(row, uint64_t(p.rows)));
+            uint64_t address = p.tiled_address + tiled_offset(x, y, z);
+            Words(output_address).values[0] = Words(address).values[0];
+            return;
+        }
+    } else if (p.load == 0) {
+        untile_coordinate(byte_at, tiled_x, tiled_y, tiled_z);
+        if (tiled_x + 4 <= p.row_bytes && tiled_y < p.rows && tiled_z < p.depth) {
+            uint64_t linear_at = (uint64_t(tiled_z) * p.rows + tiled_y) * p.row_bytes + tiled_x;
+            if ((linear_at & 3) == 0) {
+                Words(output_address).values[0] = Words(p.linear_address + linear_at).values[0];
+                return;
+            }
+        }
+    }
+    uint result = p.load != 0 ? 0 : Words(output_address).values[0];
+    for (uint b = 0; b < 4; ++b) {
+        uint64_t at = byte_at + b;
+        uint value;
+        if (p.load != 0) {
+            if (at >= used_linear)
+                continue;
+            uint64_t x = remainder(at, p.row_bytes);
+            uint64_t row = quotient(at, p.row_bytes);
+            uint y = uint(remainder(row, uint64_t(p.rows)));
+            uint z = uint(quotient(row, uint64_t(p.rows)));
+            value = read_byte(p.tiled_address + tiled_offset(x, y, z));
+        } else {
+            uint64_t x = tiled_x + b;
+            if (x >= p.row_bytes || tiled_y >= p.rows || tiled_z >= p.depth)
+                continue;
+            uint64_t linear_at = (uint64_t(tiled_z) * p.rows + tiled_y) * p.row_bytes + x;
+            value = read_byte(p.linear_address + linear_at);
+        }
+        uint shift = b * 8;
+        result = (result & ~(255u << shift)) | (value << shift);
+    }
+    Words(output_address).values[0] = result;
+}

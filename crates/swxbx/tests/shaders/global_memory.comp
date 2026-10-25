@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Node {
+    uint64_t next;
+    uint value;
+    uint spare;
+};
+layout(push_constant) uniform Push {
+    layout(offset = 0) uint64_t delta;
+    layout(offset = 8) uint64_t root;
+} pc;
+
+void main() {
+    Node root = Node(pc.root + pc.delta);
+    Node next = Node(root.next + pc.delta);
+    root.value = next.value + 1;
+    next.value = root.spare;
+}

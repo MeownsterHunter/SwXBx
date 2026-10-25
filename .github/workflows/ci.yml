@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Verify repository hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-list --max-parents=0 --count HEAD)" -eq 1
+          test "$(git log --format='%ae%n%ce' | sort -u)" = "MeownsterHunter@digital-haven.net"
+          ! rg -n -i '/home/|/var/tmp/|C:\\Users' . -g '!.git/**' -g '!.github/workflows/ci.yml'
+          ! rg -n -i 'TODO|FIXME|HACK|XXX|docs/provenance|docs/shapes' . -g '!.git/**' -g '!.github/workflows/ci.yml'
+      - name: Verify Rust and C interfaces
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude -fsyntax-only examples/host.c

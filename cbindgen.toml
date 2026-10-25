@@ -1,0 +1,8 @@
+language = "C"
+include_guard = "SWXBX_H_GENERATED"
+pragma_once = true
+style = "both"
+usize_is_size_t = true
+
+[export]
+include = ["Host", "HostVulkan", "Registers", "Status"]

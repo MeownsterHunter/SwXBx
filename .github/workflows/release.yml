@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Verify tag and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)" = "$version"
+          test "$(git rev-list --max-parents=0 --count HEAD)" -eq 1
+          test "$(git log --format='%ae%n%ce' | sort -u)" = "MeownsterHunter@digital-haven.net"
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude -fsyntax-only examples/host.c
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo build --workspace --release --all-features --locked
+          root="swxbx-$version-linux-x86_64"
+          mkdir -p "dist/$root/lib" "dist/$root/include" "dist/$root/lib/cmake/swxbx" "dist/$root/lib/pkgconfig"
+          install -m 0644 target/release/libswxbx.so target/release/libswxbx.a "dist/$root/lib/"
+          install -m 0644 include/swxbx.h "dist/$root/include/"
+          install -m 0644 cmake/swxbxConfig.cmake "dist/$root/lib/cmake/swxbx/"
+          sed "s/@VERSION@/$version/g" swxbx.pc > "dist/$root/lib/pkgconfig/swxbx.pc"
+          install -m 0644 README.md NOTICE LICENSE.md "dist/$root/"
+          cp -R LICENSES "dist/$root/"
+          tar -C dist -czf "dist/$root.tar.gz" "$root"
+          sha256sum "dist/$root.tar.gz" > "dist/$root.tar.gz.sha256"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --verify-tag --generate-notes

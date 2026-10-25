@@ -1,0 +1,101 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=64) in;
+#if CLASS == 1
+#define S1D sampler1D
+#define S1DA sampler1DArray
+#define S2D sampler2D
+#define S2DA sampler2DArray
+#define S3D sampler3D
+#define SC samplerCube
+#define SCA samplerCubeArray
+#define TO_BITS floatBitsToUint
+#elif CLASS == 2
+#define S1D isampler1D
+#define S1DA isampler1DArray
+#define S2D isampler2D
+#define S2DA isampler2DArray
+#define S3D isampler3D
+#define SC isamplerCube
+#define SCA isamplerCubeArray
+#define TO_BITS uvec4
+#else
+#define S1D usampler1D
+#define S1DA usampler1DArray
+#define S2D usampler2D
+#define S2DA usampler2DArray
+#define S3D usampler3D
+#define SC usamplerCube
+#define SCA usamplerCubeArray
+#define TO_BITS uvec4
+#endif
+#if SHAPE == 5
+layout(set=0,binding=0) uniform S1D image;
+#elif SHAPE == 6
+layout(set=0,binding=0) uniform S1DA image;
+#elif SHAPE == 0
+#if PROBE_COMPARE
+layout(set=0,binding=0) uniform sampler2DShadow image;
+#else
+layout(set=0,binding=0) uniform S2D image;
+#endif
+#elif SHAPE == 1
+layout(set=0,binding=0) uniform S2DA image;
+#elif SHAPE == 2
+layout(set=0,binding=0) uniform S3D image;
+#elif SHAPE == 3
+layout(set=0,binding=0) uniform SC image;
+#else
+layout(set=0,binding=0) uniform SCA image;
+#endif
+#if WIDE
+layout(buffer_reference,std430,buffer_reference_align=16) buffer Output { uvec4 pixels[]; };
+#else
+layout(buffer_reference,std430,buffer_reference_align=4) buffer Output { uint pixels[]; };
+#endif
+layout(push_constant,std430) uniform P { uint64_t address; uint width; uint height; uint depth; uint layer; uint level; uint offset; } p;
+void main() {
+    uint at=gl_GlobalInvocationID.x;
+    if(at>=p.width*p.height*p.depth) return;
+    uint x=at%p.width, y=(at/p.width)%p.height, z=at/(p.width*p.height);
+    uvec4 pixel;
+#if SHAPE == 5
+    pixel=TO_BITS(texelFetch(image,int(x),int(p.level)));
+#elif SHAPE == 6
+    pixel=TO_BITS(texelFetch(image,ivec2(x,p.layer),int(p.level)));
+#elif SHAPE == 0
+#if PROBE_COMPARE
+    pixel=floatBitsToUint(vec4(textureLod(image,vec3(PROBE_U,PROBE_V,PROBE_REF),PROBE_LOD),0,0,1));
+#elif PROBE
+    pixel=TO_BITS(textureLod(image,vec2(PROBE_U,PROBE_V),PROBE_LOD));
+#else
+    pixel=TO_BITS(texelFetch(image,ivec2(x,y),int(p.level)));
+#endif
+#elif SHAPE == 1
+    pixel=TO_BITS(texelFetch(image,ivec3(x,y,p.layer),int(p.level)));
+#elif SHAPE == 2
+    pixel=TO_BITS(texelFetch(image,ivec3(x,y,z),int(p.level)));
+#else
+    float s=2.0*(float(x)+0.5)/float(p.width)-1.0;
+    float t=2.0*(float(y)+0.5)/float(p.height)-1.0;
+    vec3 direction;
+    uint face=p.layer%6;
+    if(face==0) direction=vec3(1,-t,-s);
+    else if(face==1) direction=vec3(-1,-t,s);
+    else if(face==2) direction=vec3(s,1,t);
+    else if(face==3) direction=vec3(s,-1,-t);
+    else if(face==4) direction=vec3(s,-t,1);
+    else direction=vec3(-s,-t,-1);
+#if SHAPE == 3
+    pixel=TO_BITS(textureLod(image,direction,float(p.level)));
+#else
+    pixel=TO_BITS(textureLod(image,vec4(direction,float(p.layer/6)),float(p.level)));
+#endif
+#endif
+#if WIDE
+    Output(p.address).pixels[p.offset/16+at]=pixel;
+#else
+    Output(p.address).pixels[p.offset/4+at]=pixel.r|(pixel.g<<8)|(pixel.b<<16)|(pixel.a<<24);
+#endif
+}

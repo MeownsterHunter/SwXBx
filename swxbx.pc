@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: swxbx
+Description: Vulkan implementation of a console graphics API
+Version: 0.0.1
+Libs: -L${libdir} -lswxbx
+Cflags: -I${includedir}
