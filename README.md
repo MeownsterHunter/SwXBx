@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/swxbx-mark.png" width="180" alt="SwXBx logo">
+</p>
+
 # SwXBx
 
 SwXBx is a host-integrated graphics runtime. It accepts an explicit stream of

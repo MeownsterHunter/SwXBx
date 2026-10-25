@@ -44,6 +44,7 @@ jobs:
           install -m 0644 cmake/swxbxConfig.cmake "dist/$root/lib/cmake/swxbx/"
           sed "s/@VERSION@/$version/g" swxbx.pc > "dist/$root/lib/pkgconfig/swxbx.pc"
           install -m 0644 README.md NOTICE LICENSE.md "dist/$root/"
+          cp -R assets "dist/$root/"
           cp -R LICENSES "dist/$root/"
           tar -C dist -czf "dist/$root.tar.gz" "$root"
           sha256sum "dist/$root.tar.gz" > "dist/$root.tar.gz.sha256"
