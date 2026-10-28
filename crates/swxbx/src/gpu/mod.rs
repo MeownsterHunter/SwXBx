@@ -10,12 +10,13 @@ use std::sync::{Arc, Mutex};
 
 mod command_workers;
 mod commands;
+pub mod formats;
 pub mod graphics;
 mod graphics_libraries;
 mod graphics_modules;
 pub mod image_enums;
 pub mod image_layout;
-mod images;
+pub(crate) mod images;
 mod memory;
 pub mod operations;
 mod pipeline_disk;
@@ -31,15 +32,16 @@ pub mod textures;
 pub mod uniforms;
 mod validation;
 use images::{Image, Images};
+pub(crate) use present::Unoffered;
 use present::Window;
 pub mod pipelines;
-pub use memory::{GlobalMemory, TransferStatistics};
+pub use memory::{GlobalMemory, PoolFault, TransferStatistics};
 pub use subgroups::SubgroupFeatures;
 
 /// Optional device capabilities available to translated modules.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShaderFeatures {
-    /// Enabled subgroup controls and stage limits.
+    /// Enabled subgroup controls and stage limits. Evidence: the public contract.
     pub subgroups: SubgroupFeatures,
     /// Whether storage-buffer 8-bit access is enabled.
     pub storage_buffer8_bit_access: bool,
@@ -50,10 +52,10 @@ pub struct ShaderFeatures {
     /// Whether 16-bit shader integer arithmetic is enabled.
     pub shader_int16: bool,
     /// Enabled helper demotion. Spec: vulkan_core.h 1.4.363, lines 7446 and 7750.
-    /// Core 1.3 or the EXT feature structure.
+    /// Core 1.3 or the EXT feature structure. Evidence: the public contract.
     pub demote_to_helper_invocation: bool,
     /// Enabled maximal reconvergence. Spec: vulkan_core.h 1.4.363, line 13110.
-    /// KHR feature structure.
+    /// KHR feature structure. Evidence: the public contract.
     pub maximal_reconvergence: bool,
     /// Whether storage images may be read without a declared format.
     pub storage_image_read_without_format: bool,
@@ -63,6 +65,12 @@ pub struct ShaderFeatures {
     pub vertex_pipeline_stores: bool,
     /// Whether the fragment stage may store to storage resources.
     pub fragment_stores: bool,
+    /// Whether pipelines may include a geometry stage.
+    pub geometry_shader: bool,
+    /// Whether shaders may read draw parameters (BaseInstance, BaseVertex,
+    /// DrawIndex): Vulkan 1.1 shaderDrawParameters, SPIR-V capability
+    /// DrawParameters (4427).
+    pub draw_parameters: bool,
 }
 
 impl ShaderFeatures {
@@ -93,7 +101,7 @@ impl ShaderFeatures {
         self.validate_shader(words)
     }
 
-    /// Check instruction-encoded device requirements.
+    /// Check instruction-encoded device requirements. Evidence: the public contract.
     /// This is a feature check, not a replacement for SPIR-V validation.
     pub fn validate_shader(self, words: &[u32]) -> Result<(), &'static str> {
         if words.len() < 5 || words[0] != 0x0723_0203 {
@@ -125,6 +133,15 @@ impl ShaderFeatures {
                     }
                     56 if !self.storage_image_write_without_format => {
                         return Err("shaderStorageImageWriteWithoutFormat is unavailable")
+                    }
+                    2 if !self.geometry_shader => {
+                        return Err("geometryShader is unavailable on this device")
+                    }
+                    4427 if !self.draw_parameters => {
+                        return Err(
+                            "shaderDrawParameters (SPIR-V capability DrawParameters) is \
+                                    unavailable on this device",
+                        )
                     }
                     _ => {}
                 }
@@ -176,21 +193,99 @@ pub struct Context {
     /// Indices of families for which the device created queues.
     pub queue_families: Vec<u32>,
     swapchain: bool,
-    /// Whether graphics library compilation is enabled.
+    /// Whether graphics library compilation is enabled. Evidence: the public contract.
     pub graphics_pipeline_libraries: bool,
     /// Whether the device advertises linking suitable for draw-time use.
     pub graphics_pipeline_fast_linking: bool,
+    /// Whether samplers may carry a border colour of their own.
+    pub(crate) custom_border_colors: CustomBorderColors,
     pub(crate) push_descriptors: Option<ash::khr::push_descriptor::Device>,
     pub(crate) max_push_descriptors: u32,
+    /// The physical device's limits, read once at creation.
+    pub(crate) limits: vk::PhysicalDeviceLimits,
     command_workers: command_workers::Runtime,
     completion: Mutex<QueueCompletion>,
     validation: Option<validation::Validation>,
 }
 
+/// The device's custom border colours, which VK_EXT_custom_border_color
+/// provides. SwXBx uses them only when the device samples them without a
+/// format, so one sampler serves every view it meets.
+pub(crate) enum CustomBorderColors {
+    /// The device has no format-free custom border colours.
+    Absent,
+    /// Up to `samplers` samplers with a custom colour may exist at once;
+    /// `live` counts those that do.
+    Present {
+        samplers: u32,
+        live: std::sync::atomic::AtomicU32,
+    },
+}
+
+impl CustomBorderColors {
+    /// Count one more custom-colour sampler, or None when the device has
+    /// none or its limit is reached.
+    pub(crate) fn reserve(&self) -> Option<()> {
+        use std::sync::atomic::Ordering;
+        match self {
+            Self::Absent => None,
+            Self::Present { samplers, live } => live
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < *samplers).then_some(n + 1)
+                })
+                .ok()
+                .map(drop),
+        }
+    }
+
+    /// Count one custom-colour sampler destroyed.
+    pub(crate) fn release(&self) {
+        if let Self::Present { live, .. } = self {
+            live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Why the device cannot sample a custom border colour at all, or None
+    /// when it can.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Absent => {
+                Some("this device has no custom border colours it samples without a format")
+            }
+            Self::Present { .. } => None,
+        }
+    }
+
+    /// The most samplers with a custom colour that may exist at once.
+    pub(crate) fn limit(&self) -> u32 {
+        match self {
+            Self::Absent => 0,
+            Self::Present { samplers, .. } => *samplers,
+        }
+    }
+}
+
+/// A created device: its physical device, logical device, queue family,
+/// shader features, graphics pipeline libraries (enabled, fast linking) and
+/// custom border colours.
+type CreatedDevice = (
+    vk::PhysicalDevice,
+    Device,
+    u32,
+    ShaderFeatures,
+    (bool, bool),
+    CustomBorderColors,
+);
+
 struct QueueCompletion {
     semaphore: vk::Semaphore,
     value: u64,
     position: u64,
+}
+
+struct ResolvedTexture {
+    description: crate::api::TextureDescription,
+    image: Option<Arc<image_layout::ResolvedImage>>,
 }
 
 struct CoherentImage {
@@ -200,16 +295,29 @@ struct CoherentImage {
     packing: Option<crate::tiling::Layout>,
 }
 
+/// Why a texture copy did not happen.
+#[derive(Debug)]
+pub enum CopyFailure {
+    /// The copy asks for something the images cannot hold; the reason says
+    /// what.
+    Refused(String),
+    /// The device failed while copying.
+    Device,
+}
+
 /// Vulkan images, presentation, pipelines, and lazily allocated arena storage.
 pub struct Backend {
     pub(crate) command_contract: Option<operations::CommandContract>,
     pub(crate) execution: operations::Execution,
     pub(crate) first_draw: Option<graphics::FirstDrawContract>,
+    /// The image each depth format token of the installed depth and raster
+    /// contract draws with, resolved when the contract was installed.
+    pub(crate) depth_images: Vec<(u64, formats::DepthImage)>,
     pub(crate) texture_contract: textures::TextureContract,
     pub(crate) image_contract: image_layout::ImageContract,
     pub(crate) copy_decoder: Option<image_layout::CopyDecoder>,
     pub(crate) blend_contract: Option<graphics::BlendContract>,
-    samplers: HashMap<(u64, u32), textures::Sampler>,
+    samplers: crate::keymap::KeyMap<(u64, u32), textures::Sampler>,
     pub(crate) uniforms: uniforms::UniformBufferContract,
     pub(crate) graphics: graphics::GraphicsPipelines,
     windows: HashMap<u64, Window>,
@@ -219,9 +327,21 @@ pub struct Backend {
     pending_draws: Vec<graphics::PendingDraw>,
     draw_targets: Vec<u64>,
     draw_depth: Option<u64>,
-    bindings: HashMap<u64, (u64, u64, usize)>,
-    tiled: HashMap<u64, crate::tiling::Layout>,
-    coherent_images: HashMap<u64, CoherentImage>,
+    bindings: crate::keymap::KeyMap<u64, (u64, u64, usize)>,
+    tiled: crate::keymap::KeyMap<u64, crate::tiling::Layout>,
+    coherent_images: crate::keymap::KeyMap<u64, CoherentImage>,
+    /// Depth targets whose image holds their only copy
+    /// (`DepthImage::D24S8AsD32S8`), with the memory they cover: pool,
+    /// offset and bytes.
+    image_truth: crate::keymap::KeyMap<u64, ((u64, u64, u64), formats::HeldPlanes)>,
+    /// Memory such a depth target covered when it was released: swxbx never
+    /// stored the image's contents there, so the memory does not hold them
+    /// until the host writes it. Another such target over exactly that
+    /// memory takes it over.
+    orphaned_truth: Vec<(u64, u64, u64)>,
+    /// Each texture's interpretation under the image contract, kept with the
+    /// description it was made from. A texture is resolved once, not per use.
+    resolved: std::cell::RefCell<crate::keymap::KeyMap<u64, ResolvedTexture>>,
     /// Flat mapped arena, present after the first successful pool allocation.
     pub global_memory: Option<GlobalMemory>,
     context: Arc<Context>,
@@ -247,23 +367,27 @@ impl Backend {
             command_contract: None,
             execution: operations::Execution::new(&context)?,
             first_draw: None,
+            depth_images: Vec::new(),
             texture_contract: textures::TextureContract::default(),
             image_contract: image_layout::ImageContract::default(),
             copy_decoder: None,
             blend_contract: None,
-            samplers: HashMap::new(),
+            samplers: Default::default(),
             uniforms: uniforms::UniformBufferContract::default(),
             graphics: graphics::GraphicsPipelines::new(&context)?,
             windows: HashMap::new(),
             offscreen: None,
             readbacks: readbacks::Readbacks::new(&context),
             images,
+            resolved: Default::default(),
             pending_draws: Vec::new(),
             draw_targets: Vec::new(),
             draw_depth: None,
-            bindings: HashMap::new(),
-            tiled: HashMap::new(),
-            coherent_images: HashMap::new(),
+            bindings: Default::default(),
+            tiled: Default::default(),
+            coherent_images: Default::default(),
+            image_truth: Default::default(),
+            orphaned_truth: Vec::new(),
             context,
             scale: scale.max(1.0),
             global_memory: None,
@@ -339,6 +463,41 @@ impl Backend {
     ) -> Option<image_layout::ResolvedImage> {
         self.image_contract.resolve(d)
     }
+    /// The contract's interpretation of texture `key`, resolved when its
+    /// description is first seen and reused while that description holds.
+    pub(crate) fn texture_image(
+        &self,
+        key: u64,
+        d: &crate::api::TextureDescription,
+    ) -> Option<Arc<image_layout::ResolvedImage>> {
+        let mut resolved = self.resolved.borrow_mut();
+        match resolved.get(&key) {
+            Some(known) if known.description == *d => known.image.clone(),
+            _ => {
+                let image = self.image_contract.resolve(d).map(Arc::new);
+                resolved.insert(
+                    key,
+                    ResolvedTexture {
+                        description: d.clone(),
+                        image: image.clone(),
+                    },
+                );
+                image
+            }
+        }
+    }
+    /// Storage bytes of texture `key` under the image contract.
+    pub(crate) fn texture_bytes(
+        &self,
+        key: u64,
+        d: &crate::api::TextureDescription,
+    ) -> Option<usize> {
+        let r = self.texture_image(key, d)?;
+        Some(match r.storage {
+            image_layout::Storage::Linear => r.packing.linear_size(),
+            image_layout::Storage::Tiled(_) => r.packing.tiled_size(),
+        })
+    }
     pub(crate) fn has_image_contract(&self) -> bool {
         !self.image_contract.rules.is_empty()
     }
@@ -356,6 +515,7 @@ impl Backend {
             return false;
         }
         self.image_contract = contract;
+        self.resolved.get_mut().clear();
         true
     }
 
@@ -398,7 +558,7 @@ impl Backend {
         depth: bool,
     ) -> bool {
         if !self.image_contract.rules.is_empty() {
-            let Some(resolved) = self.image_contract.resolve(description) else {
+            let Some(resolved) = self.texture_image(key, description) else {
                 return false;
             };
             if depth && resolved.descriptor.format != vk::Format::D32_SFLOAT {
@@ -423,7 +583,9 @@ impl Backend {
             self.bindings
                 .insert(key, (description.pool, description.pool_offset, bytes));
             if matches!(resolved.storage, image_layout::Storage::Tiled(_)) {
-                self.tiled.insert(key, resolved.packing);
+                if self.tiled.get(&key) != Some(&resolved.packing) {
+                    self.tiled.insert(key, resolved.packing.clone());
+                }
             } else {
                 self.tiled.remove(&key);
             }
@@ -454,8 +616,22 @@ impl Backend {
                 return false;
             }
         }
+        let created = self.images.format(key).is_none();
         if !self.ensure(key, width, height, depth) {
             return false;
+        }
+        // An image with no memory behind it holds only what swxbx wrote,
+        // so a new one starts as zero, never undefined. Images over memory
+        // load it before their first use.
+        if created && description.pool == 0 {
+            let cleared = if depth {
+                self.images.clear_depth(key, Some(0.0), None)
+            } else {
+                self.images.clear_color(key, [0.0; 4], 0xf)
+            };
+            if cleared.is_none() {
+                return false;
+            }
         }
         if description.pool != 0 {
             self.bindings
@@ -466,15 +642,238 @@ impl Backend {
         true
     }
 
+    /// Create the typed image used by an image-to-image copy. Colour images
+    /// use the image contract; depth/stencil images use the depth contract,
+    /// whose planar memory layout is not an ordinary texel-block layout.
+    pub(crate) fn ensure_copy_texture(
+        &mut self,
+        key: u64,
+        description: &crate::api::TextureDescription,
+    ) -> Result<(), String> {
+        let is_2d = self
+            .first_draw
+            .as_ref()
+            .is_some_and(|contract| contract.target_2d == description.target);
+        if let Some(image) = is_2d
+            .then(|| self.depth_image(description.format))
+            .flatten()
+        {
+            self.depth_storage(key, description, image.guest())?;
+            return self
+                .ensure_depth_stencil(key, description, image)
+                .then_some(())
+                .ok_or_else(|| "the mapped depth image could not be materialized".into());
+        }
+        if self.resolved_image(description).is_some() {
+            return self
+                .ensure_texture(key, description, false)
+                .then_some(())
+                .ok_or_else(|| "the image contract could not materialize the texture".into());
+        }
+        Err(format!(
+            "format token {} is neither an image-contract format nor a mapped 2D depth format",
+            description.format
+        ))
+    }
+
+    /// Check that a depth target's memory is what swxbx draws depth over:
+    /// tightly packed planes (stride 0) in linear storage, in the format the
+    /// image contract, when there is one, stores its token as. A tiled depth
+    /// target is refused; swxbx has no tiled depth path. Source: the public contract.
+    pub(crate) fn depth_storage(
+        &self,
+        key: u64,
+        description: &crate::api::TextureDescription,
+        format: vk::Format,
+    ) -> Result<(), String> {
+        if description.stride != 0 {
+            return Err(format!(
+                "its stride is {}; swxbx draws depth over tightly packed planes (stride 0)",
+                description.stride
+            ));
+        }
+        let Some(stored) = self.texture_image(key, description) else {
+            return Ok(());
+        };
+        if stored.descriptor.format != format {
+            return Err(format!(
+                "the image contract stores format token {} as {}, but the depth and raster \
+                 contract draws with it as {}",
+                description.format,
+                formats::Name(stored.descriptor.format),
+                formats::Name(format)
+            ));
+        }
+        if matches!(stored.storage, image_layout::Storage::Tiled(_)) {
+            return Err(format!(
+                "the image contract stores format token {} tiled; swxbx draws depth only over \
+                 linear memory",
+                description.format
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create or reuse the image a depth-stencil clear writes, and return its
+    /// format. With a depth and raster contract that is the format its depth
+    /// table maps the texture's token to, the image a draw uses; without one,
+    /// swxbx clears depth as D32_SFLOAT. Source: the public contract.
+    pub(crate) fn ensure_depth_clear(
+        &mut self,
+        key: u64,
+        description: &crate::api::TextureDescription,
+    ) -> Result<vk::Format, (crate::Status, String)> {
+        let unsupported = |why: String| (crate::Status::Unimplemented, why);
+        let placed = |format: vk::Format| {
+            (
+                crate::Status::BadArgument,
+                format!(
+                    "no device image in {} over its memory ({}x{}, stride {}, at offset \
+                     {} of memory pool {})",
+                    formats::Name(format),
+                    description.width,
+                    description.height,
+                    description.stride,
+                    description.pool_offset,
+                    description.pool
+                ),
+            )
+        };
+        if self
+            .first_draw
+            .as_ref()
+            .and_then(|c| c.depth_raster.as_ref())
+            .is_none()
+        {
+            let format = vk::Format::D32_SFLOAT;
+            return if self.ensure_texture(key, description, true) {
+                Ok(format)
+            } else {
+                Err(placed(format))
+            };
+        }
+        let image = self.depth_image(description.format).ok_or_else(|| {
+            unsupported(format!(
+                "its format token {} is not mapped to exactly one depth format by the depth and \
+                 raster contract",
+                description.format
+            ))
+        })?;
+        self.depth_storage(key, description, image.guest())
+            .map_err(unsupported)?;
+        if self.ensure_depth_stencil(key, description, image) {
+            Ok(image.format())
+        } else {
+            Err(placed(image.format()))
+        }
+    }
+
+    /// The image a depth format token draws with under the installed depth
+    /// and raster contract.
+    pub(crate) fn depth_image(&self, token: u64) -> Option<formats::DepthImage> {
+        let mut found = self.depth_images.iter().filter(|(t, _)| *t == token);
+        match (found.next(), found.next()) {
+            (Some(&(_, image)), None) => Some(image),
+            _ => None,
+        }
+    }
+
+    /// Why memory `pool`, `offset`, `bytes` cannot be read or written for
+    /// texture `key`: it overlaps a depth target whose image holds its only
+    /// copy. None when it does not.
+    fn image_truth_fault(&self, key: u64, pool: u64, offset: u64, bytes: u64) -> Option<String> {
+        let overlaps = |&(p, o, n): &(u64, u64, u64)| {
+            p == pool
+                && offset.checked_add(bytes).is_none_or(|end| o < end)
+                && o.checked_add(n).is_none_or(|end| offset < end)
+        };
+        let range = format!(
+            "memory pool {pool} bytes {offset:#x}..{:#x}",
+            offset.saturating_add(bytes)
+        );
+        let live = self
+            .image_truth
+            .iter()
+            .find(|&(&owner, (region, _))| owner != key && overlaps(region))
+            .map(|(owner, _)| {
+                format!(
+                    "{range} overlap depth target texture {owner}, a D24_UNORM_S8_UINT target \
+                     swxbx draws in a D32_SFLOAT_S8_UINT image; its contents live only in that \
+                     image, not in memory"
+                )
+            });
+        live.or_else(|| {
+            self.orphaned_truth.iter().find(|r| overlaps(r)).map(|_| {
+                format!(
+                    "{range} overlap memory a released D24_UNORM_S8_UINT depth target covered; \
+                     swxbx drew it in a D32_SFLOAT_S8_UINT image and never stored its contents \
+                     there"
+                )
+            })
+        })
+    }
+
+    /// The host wrote guest memory `address`, `size`: what it wrote is what
+    /// that memory holds, so released depth images no longer stand for it.
+    pub(crate) fn host_wrote(&mut self, address: u64, size: u64) {
+        if self.orphaned_truth.is_empty() {
+            return;
+        }
+        let Some(memory) = self.global_memory.as_ref() else {
+            return;
+        };
+        for (pool, start, bytes) in memory.pool_spans(address, size) {
+            let end = start.saturating_add(bytes);
+            self.orphaned_truth = std::mem::take(&mut self.orphaned_truth)
+                .into_iter()
+                .flat_map(|(p, o, n)| {
+                    let region_end = o.saturating_add(n);
+                    if p != pool || end <= o || region_end <= start {
+                        return vec![(p, o, n)];
+                    }
+                    [(o, start.min(region_end)), (end.max(o), region_end)]
+                        .into_iter()
+                        .filter(|(from, to)| from < to)
+                        .map(|(from, to)| (p, from, to - from))
+                        .collect()
+                })
+                .collect();
+        }
+    }
+
+    /// Refuse by name a use of texture `key` other than drawing to or
+    /// clearing it when its image holds its only copy.
+    fn refuse_image_truth(&self, key: u64, used: &str) -> Option<()> {
+        if self.image_truth.contains_key(&key) {
+            crate::unsupported::refuse(
+                crate::Status::Unimplemented,
+                format!(
+                    "depth target texture {key} is a D24_UNORM_S8_UINT target swxbx draws in a \
+                     D32_SFLOAT_S8_UINT image, which holds its only copy; it cannot be {used}"
+                ),
+            );
+            return None;
+        }
+        Some(())
+    }
+
+    /// Create or reuse the depth image of a draw or depth clear, over the
+    /// caller format's depth plane and, for a format with stencil, the
+    /// stencil plane after it. A widened image does not load or store that
+    /// memory; it marks it as held by the image. Source: the public contract., 0066.
     pub(crate) fn ensure_depth_stencil(
         &mut self,
         key: u64,
         description: &crate::api::TextureDescription,
+        image: formats::DepthImage,
     ) -> bool {
+        let Some(planes) = formats::depth_planes(image.guest()) else {
+            return false;
+        };
         let Some(bytes) = description
             .width
             .checked_mul(description.height)
-            .and_then(|n| n.checked_mul(5))
+            .map(|texels| planes.size(texels))
             .and_then(|n| usize::try_from(n).ok())
         else {
             return false;
@@ -494,16 +893,39 @@ impl Backend {
         {
             return false;
         }
-        if !self.images.ensure_format(
-            key,
-            description.width,
-            description.height,
-            vk::Format::D32_SFLOAT_S8_UINT,
-        ) {
+        let region = (description.pool, description.pool_offset, bytes as u64);
+        if image == formats::DepthImage::D24S8AsD32S8 {
+            self.orphaned_truth.retain(|r| *r != region);
+        }
+        if let Some(why) = self.image_truth_fault(key, region.0, region.1, region.2) {
+            crate::unsupported::refuse(
+                crate::Status::Unimplemented,
+                format!("depth target texture {key}: {why}"),
+            );
             return false;
         }
-        self.bindings
-            .insert(key, (description.pool, description.pool_offset, bytes));
+        if !self
+            .images
+            .ensure_format(key, description.width, description.height, image.format())
+        {
+            return false;
+        }
+        match image {
+            formats::DepthImage::Exact(_) => {
+                self.image_truth.remove(&key);
+                self.bindings
+                    .insert(key, (description.pool, description.pool_offset, bytes));
+            }
+            formats::DepthImage::D24S8AsD32S8 => {
+                self.bindings.remove(&key);
+                self.coherent_images.remove(&key);
+                let held = match self.image_truth.get(&key) {
+                    Some(&(held_region, held)) if held_region == region => held,
+                    _ => formats::HeldPlanes::Unwritten,
+                };
+                self.image_truth.insert(key, (region, held));
+            }
+        }
         true
     }
 
@@ -511,6 +933,13 @@ impl Backend {
         #[cfg(feature = "draw-metrics")]
         let _span = crate::draw_metrics::PipelineSpan::new(12);
         if let Some(&(pool, offset, bytes)) = self.bindings.get(&key) {
+            if let Some(why) = self.image_truth_fault(key, pool, offset, bytes as u64) {
+                crate::unsupported::refuse(
+                    crate::Status::Unimplemented,
+                    format!("texture {key}: {why}"),
+                );
+                return None;
+            }
             let binding = (pool, offset, bytes);
             let packing = self.tiled.get(&key);
             let (buffer, offset) = self
@@ -569,6 +998,7 @@ impl Backend {
         key: u64,
         description: &crate::api::TextureDescription,
     ) -> Option<vk::ImageView> {
+        self.refuse_image_truth(key, "sampled")?;
         if !self.ensure_texture(key, description, false) {
             return None;
         }
@@ -576,7 +1006,7 @@ impl Backend {
         if self.image_contract.swizzles.is_empty() {
             self.images.sampled(key)
         } else {
-            let components = self.image_contract.resolve(description)?.components;
+            let components = self.texture_image(key, description)?.components;
             self.images.sampled_with_components(key, components)
         }
     }
@@ -673,6 +1103,9 @@ impl Backend {
 
     /// Upload a whole typed image in packed-linear order; return false on failure.
     pub fn upload_image(&mut self, key: u64, bytes: &[u8]) -> bool {
+        if self.refuse_image_truth(key, "uploaded to").is_none() {
+            return false;
+        }
         self.coherent_images.remove(&key);
         self.images.upload(key, bytes).is_some()
     }
@@ -837,29 +1270,74 @@ impl Backend {
         self.images.remove(key);
         self.bindings.remove(&key);
         self.tiled.remove(&key);
+        if let Some((region, _)) = self.image_truth.remove(&key) {
+            self.orphaned_truth.push(region);
+        }
     }
 
     /// Clear selected RGBA channels; mask bits zero through three select channels.
-    pub fn clear_color(&mut self, key: u64, color: [f32; 4], mask: u32) -> bool {
+    /// `color` holds the clear's four 32-bit words, read in the image
+    /// format's numeric class. A clear swxbx cannot do for the image's
+    /// format is refused by name with `Status::Unimplemented`; other
+    /// failures are refused by name with `Status::InternalError`.
+    pub fn clear_color(
+        &mut self,
+        key: u64,
+        color: [f32; 4],
+        mask: u32,
+    ) -> Result<(), crate::Status> {
+        let internal = |what: &str| {
+            crate::unsupported::refuse(
+                crate::Status::InternalError,
+                format!("clear texture {key}: the device could not {what}"),
+            )
+        };
+        self.sync_texture(key, true)
+            .ok_or_else(|| internal("bring the image up to date"))?;
+        let format = self
+            .images
+            .format(key)
+            .ok_or_else(|| internal("find the image"))?;
+        formats::color_clear(format, color, mask)
+            .map_err(|why| crate::unsupported::refuse(crate::Status::Unimplemented, why))?;
+        (|| {
+            self.images.clear_color(key, color, mask)?;
+            self.sync_texture(key, false)
+        })()
+        .ok_or_else(|| internal("record the clear"))
+    }
+
+    /// Clear the depth and, when `stencil` is given, the stencil of a depth
+    /// image to the given values.
+    pub fn clear_depth(&mut self, key: u64, depth: Option<f32>, stencil: Option<u32>) -> bool {
         (|| {
             self.sync_texture(key, true)?;
-            self.images.clear_color(key, color, mask)?;
+            self.images.clear_depth(key, depth, stencil)?;
+            if let Some((_, held)) = self.image_truth.get_mut(&key) {
+                *held = held.cleared(depth, stencil);
+            }
             self.sync_texture(key, false)
         })()
         .is_some()
     }
 
-    /// Clear a depth image; the current depth-only path does not use stencil.
-    pub fn clear_depth(&mut self, key: u64, depth: f32, stencil: u32) -> bool {
-        if stencil != 0 {
-            return false;
-        }
-        (|| {
-            self.sync_texture(key, true)?;
-            self.images.clear_depth(key, depth)?;
-            self.sync_texture(key, false)
-        })()
-        .is_some()
+    /// Why a draw that tests depth and stencil as given cannot read depth
+    /// target `key`: it is drawn in a widened image no clear has written the
+    /// plane of. None when it can.
+    pub(crate) fn unheld_depth(
+        &self,
+        key: u64,
+        depth_test: bool,
+        stencil_test: bool,
+    ) -> Option<String> {
+        let &(_, held) = self.image_truth.get(&key)?;
+        held.missing(depth_test, stencil_test).map(|plane| {
+            format!(
+                "depth target texture {key} is a D24_UNORM_S8_UINT target swxbx draws in a \
+                 D32_SFLOAT_S8_UINT image, which cannot be loaded from memory, and the draw tests \
+                 its {plane} before a clear wrote it"
+            )
+        })
     }
 
     pub(crate) fn set_parallel_recording(&mut self, enabled: bool) {
@@ -944,6 +1422,7 @@ impl Backend {
 
     /// Return unscaled RGBA image bytes and dimensions, or None on failure.
     pub fn readback(&mut self, key: u64) -> Option<(u32, u32, Vec<u8>)> {
+        self.refuse_image_truth(key, "read back")?;
         self.sync_texture(key, true)?;
         self.images.readback(key)
     }
@@ -951,6 +1430,7 @@ impl Backend {
     /// Upload tightly packed four-byte color texels into the keyed image.
     pub fn upload(&mut self, key: u64, data: &[u8], width: u64, height: u64) -> bool {
         (|| {
+            self.refuse_image_truth(key, "uploaded to")?;
             if !self.ensure(key, width, height, false) {
                 return None;
             }
@@ -968,6 +1448,14 @@ impl Backend {
         size: usize,
     ) -> bool {
         (|| {
+            self.refuse_image_truth(key, "copied to")?;
+            if let Some(why) = self.image_truth_fault(key, pool, offset, size as u64) {
+                crate::unsupported::refuse(
+                    crate::Status::Unimplemented,
+                    format!("copy to texture {key}: {why}"),
+                );
+                return None;
+            }
             let (buffer, offset) = self
                 .global_memory
                 .as_ref()?
@@ -984,21 +1472,54 @@ impl Backend {
         .is_some()
     }
 
-    /// Copy equal-format image regions; return false for unsupported or invalid regions.
+    /// Copy equal-format image regions. A region the images cannot hold is
+    /// refused with its reason before any device work.
     pub fn copy_region(
         &mut self,
         destination: u64,
         source: u64,
         from: image_layout::ImageRegion,
         to: image_layout::ImageRegion,
-    ) -> bool {
+    ) -> Result<(), CopyFailure> {
+        if let Some(fault) = self.images.copy_fault(destination, source, from, to) {
+            return Err(CopyFailure::Refused(fault));
+        }
+        let source_held = self.image_truth.get(&source).map(|(_, held)| *held);
+        let destination_held = self.image_truth.get(&destination).map(|(_, held)| *held);
+        match (source_held, destination_held) {
+            (Some(held), Some(_))
+                if self.images.complete_region(source, from)
+                    && self.images.complete_region(destination, to) =>
+            {
+                self.images
+                    .copy_region(destination, source, from, to)
+                    .ok_or(CopyFailure::Device)?;
+                if let Some((_, destination_held)) = self.image_truth.get_mut(&destination) {
+                    *destination_held = held;
+                }
+                return Ok(());
+            }
+            (Some(_), _) | (_, Some(_)) => {
+                let key = if source_held.is_some() {
+                    source
+                } else {
+                    destination
+                };
+                return Err(CopyFailure::Refused(format!(
+                    "depth target texture {key} is a D24_UNORM_S8_UINT target swxbx draws in a \
+                     D32_SFLOAT_S8_UINT image, which holds its only copy; only a complete copy to \
+                     another such image is representable"
+                )));
+            }
+            (None, None) => {}
+        }
         (|| {
             self.sync_texture(source, true)?;
             self.sync_texture(destination, true)?;
             self.images.copy_region(destination, source, from, to)?;
             self.sync_texture(destination, false)
         })()
-        .is_some()
+        .ok_or(CopyFailure::Device)
     }
     /// Blit compatible image regions with the selected filter; return false on failure.
     pub fn blit_region(
@@ -1010,6 +1531,8 @@ impl Backend {
         filter: vk::Filter,
     ) -> bool {
         (|| {
+            self.refuse_image_truth(source, "blitted")?;
+            self.refuse_image_truth(destination, "blitted to")?;
             self.sync_texture(source, true)?;
             self.sync_texture(destination, true)?;
             self.images
@@ -1022,6 +1545,8 @@ impl Backend {
     /// Copy a whole image between existing compatible images; return false on failure.
     pub fn copy(&mut self, destination: u64, source: u64) -> bool {
         (|| {
+            self.refuse_image_truth(source, "copied")?;
+            self.refuse_image_truth(destination, "copied to")?;
             self.sync_texture(source, true)?;
             self.images.copy(destination, source)?;
             self.sync_texture(destination, false)
@@ -1059,6 +1584,33 @@ impl Backend {
         Some(())
     }
 
+    /// Ask the surface of a window just opened whether it offers the mode.
+    pub(crate) fn window_takes(
+        &self,
+        key: u64,
+        mode: crate::PresentationMode,
+    ) -> Result<(), present::Unoffered> {
+        self.windows
+            .get(&key)
+            .ok_or(present::Unoffered::CannotBeAsked)?
+            .offers(mode)
+    }
+
+    /// Whether any native window is open.
+    pub(crate) fn has_windows(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    /// An open window whose surface does not offer the mode or cannot be asked.
+    pub(crate) fn window_lacking(
+        &self,
+        mode: crate::PresentationMode,
+    ) -> Option<(u64, present::Unoffered)> {
+        self.windows
+            .iter()
+            .find_map(|(&key, window)| window.offers(mode).err().map(|why| (key, why)))
+    }
+
     pub(crate) fn close_window(&mut self, key: u64) {
         self.windows.remove(&key);
     }
@@ -1068,22 +1620,51 @@ impl Backend {
         host: &crate::Host,
         window: u64,
         texture: u64,
-        _interval: u32,
+        interval: crate::PresentInterval,
+        scaling: crate::Scaling,
         config: crate::PresentationConfig,
-    ) -> Option<bool> {
+    ) -> Result<bool, crate::Status> {
+        let failed = crate::Status::InternalError;
         let mut extent = vk::Extent2D::default();
         let surface_host = unsafe { &*host.vulkan };
         unsafe {
             (surface_host.drawable_size)(host.user, window, &mut extent.width, &mut extent.height);
         }
-        self.sync_texture(texture, true)?;
-        let source = self.images.source(texture)?;
-        if source.format != vk::Format::R8G8B8A8_UNORM {
-            return None;
+        self.sync_texture(texture, true).ok_or(failed)?;
+        let key = window;
+        // The blit reads the texture's stored bytes. Source: the public contract.
+        let source = self.images.shown_source(texture).map_err(|(status, why)| {
+            crate::unsupported::refuse(
+                status,
+                format!("window {key:#x} cannot show texture {texture}: {why}"),
+            )
+        })?;
+        let window = self.windows.get_mut(&window).ok_or(failed)?;
+        // The blit converts from the texture's own format. Source: the public contract.
+        window.blits_from(source.format).map_err(|why| {
+            crate::unsupported::refuse(
+                crate::Status::Unimplemented,
+                format!("window {key:#x} cannot show texture {texture}: {why}"),
+            )
+        })?;
+        // FIFO holds each present for one vertical blank: N presents of the
+        // image hold it for the N blanks its interval asks. Mailbox takes
+        // only intervals 0 and 1, both one present. Source: the public contract.
+        let presents = match config.mode {
+            crate::PresentationMode::Fifo => interval.fifo_presents(),
+            crate::PresentationMode::Mailbox => 1,
+        };
+        for _ in 1..presents {
+            if !window
+                .present(source, extent, scaling, config)
+                .ok_or(failed)?
+            {
+                return Ok(false);
+            }
         }
-        self.windows
-            .get_mut(&window)?
-            .present(source, extent, config)
+        window
+            .present(source, extent, scaling, config)
+            .ok_or(failed)
     }
 
     /// Offscreen presentation uses the same blit and barriers as a swapchain.
@@ -1105,8 +1686,26 @@ impl Backend {
             return None;
         }
         self.sync_texture(texture, true)?;
-        let source = self.images.source(texture)?;
-        if source.format != vk::Format::R8G8B8A8_UNORM {
+        let source = self
+            .images
+            .shown_source(texture)
+            .map_err(|(status, why)| {
+                crate::unsupported::refuse(
+                    status,
+                    format!("offscreen present cannot show texture {texture}: {why}"),
+                )
+            })
+            .ok()?;
+        if !images::can_blit(&self.context, source.format, format) {
+            crate::unsupported::refuse(
+                crate::Status::Unimplemented,
+                format!(
+                    "offscreen present cannot show texture {texture}: the device cannot blit {} \
+                     into {}",
+                    formats::Name(source.format),
+                    formats::Name(format)
+                ),
+            );
             return None;
         }
         if !self.offscreen.as_ref().is_some_and(|image| {
@@ -1173,12 +1772,18 @@ impl Backend {
         if !current {
             self.sync_texture(texture, true)?;
         }
-        self.images.readback_source(texture, |source| {
-            if source.format != vk::Format::R8G8B8A8_UNORM {
-                return None;
-            }
-            self.readbacks.submit(slot, source, width, height)
-        })
+        // The readback blits the texture's stored bytes. Source: the public contract.
+        let source = self
+            .images
+            .shown_source(texture)
+            .map_err(|(status, why)| {
+                crate::unsupported::refuse(
+                    status,
+                    format!("presentation readback cannot show texture {texture}: {why}"),
+                )
+            })
+            .ok()?;
+        self.readbacks.submit(slot, source, width, height)
     }
 
     pub(crate) fn read_callback(
@@ -1367,7 +1972,15 @@ impl Context {
             api_version,
             matches!(validation_mode, Some(validation::Mode::Gpu)),
         );
-        let Some((pick, device, family, shader_features, libraries, fast_linking)) = result else {
+        let Some((
+            pick,
+            device,
+            family,
+            shader_features,
+            (libraries, fast_linking),
+            custom_border_colors,
+        )) = result
+        else {
             if let Some(validation) = validation.as_mut() {
                 validation.detach();
             }
@@ -1411,8 +2024,10 @@ impl Context {
             validation,
             graphics_pipeline_libraries: libraries,
             graphics_pipeline_fast_linking: fast_linking,
+            custom_border_colors,
             push_descriptors,
             max_push_descriptors: push.max_push_descriptors,
+            limits: unsafe { instance.get_physical_device_properties(pick) }.limits,
             completion: Mutex::new(QueueCompletion {
                 semaphore,
                 value: 0,
@@ -1450,7 +2065,7 @@ impl Context {
         swapchain: bool,
         api_version: u32,
         gpu_validation: bool,
-    ) -> Option<(vk::PhysicalDevice, Device, u32, ShaderFeatures, bool, bool)> {
+    ) -> Option<CreatedDevice> {
         // SAFETY: instance is live for all enumeration and feature queries below.
         let mut devices = unsafe { instance.enumerate_physical_devices().ok()? };
         devices.sort_by_key(|&device| unsafe {
@@ -1540,6 +2155,21 @@ impl Context {
             let fast_linking = libraries
                 && library_properties.graphics_pipeline_library_fast_linking != vk::FALSE
                 && std::env::var_os("SWXBX_DISABLE_FAST_LINKING").is_none();
+            let border_extension = has(ash::ext::custom_border_color::NAME);
+            let mut border_features = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
+            let mut border_properties = vk::PhysicalDeviceCustomBorderColorPropertiesEXT::default();
+            if border_extension {
+                let mut query =
+                    vk::PhysicalDeviceFeatures2::default().push_next(&mut border_features);
+                unsafe { instance.get_physical_device_features2(pick, &mut query) };
+                let mut query =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut border_properties);
+                unsafe { instance.get_physical_device_properties2(pick, &mut query) };
+            }
+            let custom_borders = border_extension
+                && border_features.custom_border_colors != vk::FALSE
+                && border_features.custom_border_color_without_format != vk::FALSE
+                && border_properties.max_custom_border_color_samplers > 0;
             let demote_extension =
                 !core13 && has(ash::ext::shader_demote_to_helper_invocation::NAME);
             let reconvergence_extension = has(ash::khr::shader_maximal_reconvergence::NAME);
@@ -1590,6 +2220,7 @@ impl Context {
                 ),
                 storage_buffer8_bit_access: v12.storage_buffer8_bit_access != vk::FALSE,
                 storage_buffer16_bit_access: v11.storage_buffer16_bit_access != vk::FALSE,
+                draw_parameters: v11.shader_draw_parameters != vk::FALSE,
                 shader_int8: v12.shader_int8 != vk::FALSE,
                 shader_int16: core.shader_int16 != vk::FALSE,
                 demote_to_helper_invocation: if core13 {
@@ -1605,6 +2236,7 @@ impl Context {
                     != vk::FALSE,
                 vertex_pipeline_stores: core.vertex_pipeline_stores_and_atomics != vk::FALSE,
                 fragment_stores: core.fragment_stores_and_atomics != vk::FALSE,
+                geometry_shader: core.geometry_shader != vk::FALSE,
             };
             let enabled = vk::PhysicalDeviceFeatures::default()
                 .vertex_pipeline_stores_and_atomics(shader_features.vertex_pipeline_stores)
@@ -1625,15 +2257,18 @@ impl Context {
                 .shader_int16(shader_features.shader_int16)
                 .fill_mode_non_solid(core.fill_mode_non_solid != 0)
                 .depth_bias_clamp(core.depth_bias_clamp != 0)
-                .shader_clip_distance(core.shader_clip_distance != 0);
+                .shader_clip_distance(core.shader_clip_distance != 0)
+                .geometry_shader(shader_features.geometry_shader);
             let mut enabled11 = vk::PhysicalDeviceVulkan11Features::default()
-                .storage_buffer16_bit_access(shader_features.storage_buffer16_bit_access);
+                .storage_buffer16_bit_access(shader_features.storage_buffer16_bit_access)
+                .shader_draw_parameters(shader_features.draw_parameters);
             let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default()
                 .vulkan_memory_model(gpu_validation)
                 .vulkan_memory_model_device_scope(gpu_validation)
                 .scalar_block_layout(gpu_validation)
                 .buffer_device_address(true)
                 .timeline_semaphore(true)
+                .sampler_mirror_clamp_to_edge(v12.sampler_mirror_clamp_to_edge != vk::FALSE)
                 .storage_buffer8_bit_access(shader_features.storage_buffer8_bit_access)
                 .shader_int8(shader_features.shader_int8);
             let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -1679,6 +2314,9 @@ impl Context {
             if has(ash::ext::depth_range_unrestricted::NAME) {
                 extensions.push(ash::ext::depth_range_unrestricted::NAME.as_ptr());
             }
+            if custom_borders {
+                extensions.push(ash::ext::custom_border_color::NAME.as_ptr());
+            }
             if libraries {
                 extensions.push(ash::ext::graphics_pipeline_library::NAME.as_ptr());
                 extensions.push(ash::khr::pipeline_library::NAME.as_ptr());
@@ -1712,6 +2350,12 @@ impl Context {
             if libraries {
                 device_info = device_info.push_next(&mut enabled_library);
             }
+            let mut enabled_borders = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default()
+                .custom_border_colors(true)
+                .custom_border_color_without_format(true);
+            if custom_borders {
+                device_info = device_info.push_next(&mut enabled_borders);
+            }
             // SAFETY: the selected family supports graphics and the create info is valid.
             if let Ok(device) = unsafe { instance.create_device(pick, &device_info, None) } {
                 return Some((
@@ -1719,8 +2363,15 @@ impl Context {
                     device,
                     family,
                     shader_features,
-                    libraries,
-                    fast_linking,
+                    (libraries, fast_linking),
+                    if custom_borders {
+                        CustomBorderColors::Present {
+                            samplers: border_properties.max_custom_border_color_samplers,
+                            live: 0.into(),
+                        }
+                    } else {
+                        CustomBorderColors::Absent
+                    },
                 ));
             }
         }
@@ -1822,13 +2473,13 @@ mod tests {
             assert!(backend.ensure(key, 4, 4, false));
             backend.bindings.insert(key, (10, 0, 64));
         }
-        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 0xf));
+        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 0xf).is_ok());
         backend.enqueue_callback(0, 1, 4, 4).unwrap();
         assert_eq!(
             &backend.read_callback(0, true).unwrap().unwrap().2[..4],
             &[255, 0, 0, 255]
         );
-        assert!(backend.clear_color(2, [0.0, 0.0, 1.0, 1.0], 0xf));
+        assert!(backend.clear_color(2, [0.0, 0.0, 1.0, 1.0], 0xf).is_ok());
         backend.enqueue_callback(0, 1, 4, 4).unwrap();
         assert_eq!(
             &backend.read_callback(0, true).unwrap().unwrap().2[..4],
@@ -1845,7 +2496,7 @@ mod tests {
             &backend.read_callback(0, true).unwrap().unwrap().2[..4],
             &[0, 255, 0, 255]
         );
-        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 0xf));
+        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 0xf).is_ok());
         assert!(backend.upload_image(1, &[0, 0, 255, 255].repeat(16)));
         backend.enqueue_callback(0, 1, 4, 4).unwrap();
         assert_eq!(
@@ -1886,7 +2537,7 @@ mod tests {
             return;
         };
         assert!(backend.ensure(1, 4, 4, false));
-        assert!(backend.clear_color(1, [1.0, 0.5, 0.0, 1.0], 0xf));
+        assert!(backend.clear_color(1, [1.0, 0.5, 0.0, 1.0], 0xf).is_ok());
         let (width, height, pixels) = backend.readback(1).expect("Vulkan readback");
         assert_eq!((width, height), (4, 4));
         assert_eq!(&pixels[..4], &[255, 128, 0, 255]);
@@ -1898,7 +2549,7 @@ mod tests {
             return;
         };
         assert!(backend.ensure(1, 2, 1, false));
-        assert!(backend.clear_color(1, [0.0, 0.0, 1.0, 1.0], 0xf));
+        assert!(backend.clear_color(1, [0.0, 0.0, 1.0, 1.0], 0xf).is_ok());
         backend.enqueue_callback(0, 1, 2, 1).unwrap();
         let (width, height, pixels) = backend
             .read_callback(0, true)

@@ -10,8 +10,9 @@
 //! [`ShaderTranslator`] supplies translated SPIR-V; no translator is included.
 //! [`startup_cache`] loads translated output and schedules owned worker requests.
 //!
-//! The public integration contract is documented in `docs/host-contract.md`.
-//! Host execution uses explicit Vulkan contracts and synthetic tests.
+//! The repository guide lives in `docs/guide`. Guest behavior is limited to the
+//! signature, shape, census, and provenance records. Public host execution uses
+//! Vulkan contracts and original synthetic tests.
 #![deny(missing_docs)]
 
 pub mod api;
@@ -27,9 +28,13 @@ pub mod global_memory;
 #[cfg(feature = "vulkan")]
 pub mod gpu;
 mod instance;
+mod keymap;
 pub mod observe;
 pub mod presentation;
-pub use presentation::{FrameStatistics, PresentationConfig, PresentationMode};
+pub use presentation::{
+    Aspect, FrameStatistics, HostScaling, PresentInterval, PresentationConfig, PresentationMode,
+    Scaling, SCALING_FIT, SCALING_STRETCH,
+};
 pub mod startup_cache;
 pub mod surfaces;
 pub mod tiling;
@@ -50,7 +55,7 @@ use std::sync::Arc;
 
 /// Version of the host interface. It changes when a host built against an
 /// older `include/swxbx.h` could no longer use the library.
-pub const HOST_INTERFACE_VERSION: u32 = 5;
+pub const HOST_INTERFACE_VERSION: u32 = 6;
 
 /// Returned by lookups for a name the library does not know.
 pub const FUNCTION_NONE: u32 = u32::MAX;
@@ -179,8 +184,31 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+/// Name why this thread's call failed, for `swxbx_last_error`.
+pub(crate) fn set_last_error(message: &str) {
+    LAST_ERROR.with(|error| {
+        *error.borrow_mut() =
+            Some(CString::new(message.replace('\0', " ")).expect("NUL bytes were replaced"))
+    });
+}
+
+/// This thread's last reason, if a call on it failed with one.
+pub(crate) fn last_error() -> Option<String> {
+    LAST_ERROR.with(|error| {
+        error
+            .borrow()
+            .as_ref()
+            .map(|message| message.to_string_lossy().into_owned())
+    })
+}
+
+/// Forget this thread's last reason, so the next one belongs to the next call.
+pub(crate) fn clear_last_error() {
     LAST_ERROR.with(|error| *error.borrow_mut() = None);
+}
+
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    clear_last_error();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(payload) => {
@@ -200,7 +228,8 @@ fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// The most recent panic message on this thread, or null when there was none.
+/// Why the most recent failed call on this thread failed: a refused
+/// command's reason or a panic message. Null when there was none.
 #[no_mangle]
 pub extern "C" fn swxbx_last_error() -> *const c_char {
     // Not wrapped in `ffi_guard`, which would clear the message first.
@@ -319,7 +348,10 @@ pub unsafe extern "C" fn swxbx_instance_notify_memory_write(
     })
 }
 
-/// Adopt coherent arena storage for a registered pool. Returns null on failure.
+/// Adopt coherent arena storage for a registered pool. Batches submitted on this
+/// instance before the call run first, so none of them runs after the pool's
+/// backing changed. Returns null on failure and names the reason through
+/// `swxbx_last_error`.
 ///
 /// # Safety
 /// `instance` must be live or null. The host must satisfy the mapping and access
@@ -343,10 +375,17 @@ pub unsafe extern "C" fn swxbx_instance_map_pool(instance: *const Instance, pool
 }
 
 /// Wait for device access to a mapped host range. Nonzero `write` waits for readers too.
+/// Batches submitted on this instance before this call run first and their
+/// device access is waited for, so a host write after such a submit never races
+/// a batch that has not read yet; batches submitted concurrently from another
+/// thread are not covered. Returns `BadArgument` for a range outside a registered
+/// pool or a call on SwXBx's execution thread, and `InternalError` when the
+/// device was lost or the wait failed, naming the reason through
+/// `swxbx_last_error`.
 ///
 /// # Safety
-/// `instance` must be a live instance pointer, or null. Serialize access to mapped
-/// storage with submissions until the host read or write has finished.
+/// `instance` must be a live instance pointer, or null. Finish the host read
+/// or write before submitting work that uses the range.
 #[no_mangle]
 pub unsafe extern "C" fn swxbx_instance_wait_pool(
     instance: *const Instance,
@@ -364,11 +403,7 @@ pub unsafe extern "C" fn swxbx_instance_wait_pool(
         };
         #[cfg(feature = "vulkan")]
         {
-            if instance.wait_pool(pool, offset, size, write != 0) {
-                Status::Ok
-            } else {
-                Status::BadArgument
-            }
+            instance.wait_pool(pool, offset, size, write != 0)
         }
         #[cfg(not(feature = "vulkan"))]
         {
@@ -413,7 +448,13 @@ pub unsafe extern "C" fn swxbx_instance_destroy(instance: *mut Instance) {
     })
 }
 
-/// Set presentation capacity and mode, zero for FIFO or one for mailbox.
+/// Set presentation capacity and mode, zero for FIFO or one for mailbox. With a
+/// Vulkan-surface host, mailbox needs an open window and every open window's
+/// surface must offer it. Otherwise it returns `BadArgument` (no open window, or
+/// a surface without the mode) or `InternalError` (a surface that cannot be
+/// asked), names the reason through `swxbx_last_error`, and keeps the previous
+/// policy. A window opened later while mailbox is set is asked when it opens and
+/// refused the same way. FIFO is always accepted.
 ///
 /// # Safety
 /// `instance` must be live. Presentation callbacks must not reenter the library.
@@ -481,7 +522,8 @@ pub unsafe extern "C" fn swxbx_instance_frame_statistics(
 }
 
 /// Set or clear the directory for local debugging dumps of translated
-/// shaders. The files contain translated output, never input shader bytes.
+/// shaders. The files contain translated output derived from the observed
+/// program's shaders and never the original shader bytes.
 ///
 /// # Safety
 /// `instance` must be live and `directory` must be null or NUL-terminated
@@ -590,8 +632,9 @@ pub unsafe extern "C" fn swxbx_instance_call(
     })
 }
 
-/// Report a completed host call. `registers` contains its result registers so
-/// diagnostics can sample results with arguments.
+/// The original implementation of `function` returned. `registers` holds
+/// its result registers. Only hosts that let the original implementation run
+/// call this; it lets results be sampled along with arguments.
 ///
 /// # Safety
 /// `instance` must be live and `registers` must point to a valid `Registers`.

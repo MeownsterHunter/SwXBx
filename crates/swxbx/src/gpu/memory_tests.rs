@@ -455,7 +455,7 @@ fn image_writeback_does_not_download_the_surrounding_pool() {
         ..TextureDescription::default()
     };
     assert!(backend.ensure_texture(2, &description, false));
-    assert!(backend.clear_color(2, [1.0, 0.0, 0.0, 1.0], 15));
+    assert!(backend.clear_color(2, [1.0, 0.0, 0.0, 1.0], 15).is_ok());
     let memory = backend.global_memory.as_mut().unwrap();
     let mut outputs = Vec::new();
     assert!(memory.download(|address, bytes| {

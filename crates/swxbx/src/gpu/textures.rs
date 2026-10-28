@@ -1,9 +1,9 @@
-//! Bounded sampled images and explicit host interpretations.
+//! Bounded sampled images and explicit host interpretations. Source: the public contract.; 0032.
 use super::image_enums::{validate_rules, EnumRule};
 use super::{
     graphics::{instructions, mapped},
     pipelines::stage_bindings,
-    uniforms::UniformStage,
+    uniforms::GraphicsStage,
     Context,
 };
 pub use crate::api::SamplerDescription;
@@ -11,7 +11,7 @@ use crate::tiling::ImageKind;
 use ash::vk;
 use std::{collections::HashSet, sync::Arc};
 
-/// One recorded slot mapped to the translator's descriptor pair.
+/// One recorded slot mapped to the translator's original descriptor pair.
 #[derive(Clone, Copy, Debug)]
 pub struct TextureMapping {
     /// Raw stage token supplied by the caller.
@@ -19,7 +19,7 @@ pub struct TextureMapping {
     /// Raw binding index supplied by the caller.
     pub index: u64,
     /// Translated shader stage receiving the descriptor pair.
-    pub target: UniformStage,
+    pub target: GraphicsStage,
     /// Descriptor set number in the translated module.
     pub set: u32,
     /// Sampled-image descriptor binding number in the translated module.
@@ -28,22 +28,55 @@ pub struct TextureMapping {
     pub sampler: u32,
 }
 
+/// A bindless texture is named by the locations of its handle words: the
+/// texture by the word that holds its texture id, the sampler by the word
+/// that holds its sampler id. A handle of one constant-buffer word names
+/// that word for both; a handle of two words or-ed names the first for the
+/// texture and the second for the sampler (the reference host (MIT)
+/// `Shader/Translation/Optimizations/BindlessElimination.cs` and
+/// `Shader/TextureHandle.cs` `ReadPackedId`; Copyright (c) the reference host Team and
+/// Contributors). The caller binds the texture and sampler of a location
+/// with the separate texture and sampler binding calls of stage token
+/// `stage`, at index `base + (bank << 16 | byte offset)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocationMapping {
+    /// Raw stage token supplied by the caller.
+    pub stage: u64,
+    /// Translated shader stage whose bindless textures the indices name.
+    pub target: GraphicsStage,
+    /// Index of bank 0, byte offset 0.
+    pub base: u64,
+}
+
+/// The indices a location mapping spans: every bank and byte offset.
+pub(crate) const LOCATION_SPAN: u64 = 1 << 24;
+
+impl LocationMapping {
+    /// The binding-call index of the word at `bank`, byte `offset`.
+    pub(crate) fn index(&self, bank: u8, offset: u16) -> u64 {
+        self.base + (u64::from(bank) << 16 | u64::from(offset))
+    }
+}
+
 /// The translated stage a surface slot belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceStage {
     /// Vertex shader stage.
     Vertex,
+    /// Geometry shader stage.
+    Geometry,
     /// Fragment shader stage.
     Fragment,
     /// Compute shader stage.
     Compute,
 }
 
-impl From<UniformStage> for SurfaceStage {
-    fn from(stage: UniformStage) -> Self {
+impl From<GraphicsStage> for SurfaceStage {
+    fn from(stage: GraphicsStage) -> Self {
         match stage {
-            UniformStage::Vertex => Self::Vertex,
-            UniformStage::Fragment => Self::Fragment,
+            GraphicsStage::Vertex => Self::Vertex,
+            GraphicsStage::Geometry => Self::Geometry,
+            GraphicsStage::Fragment => Self::Fragment,
         }
     }
 }
@@ -67,8 +100,34 @@ pub struct SurfaceMapping {
 pub struct MinFilter {
     /// Filter applied to texels within a mip level.
     pub texel: vk::Filter,
-    /// Filter applied between mip levels.
-    pub mip: vk::SamplerMipmapMode,
+    /// Which mip levels minification reads.
+    pub mip: MipFilter,
+}
+
+/// The mip levels a minifying sample reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MipFilter {
+    /// Only the texture's base level, whatever the sampler's LOD range.
+    BaseLevel,
+    /// The nearest level to the computed LOD.
+    Nearest,
+    /// A blend of the two levels around the computed LOD.
+    Linear,
+}
+
+impl MipFilter {
+    /// The Vulkan mipmap mode and LOD clamp that read these levels. Vulkan
+    /// has no mode without mipmapping; its specification reads only the
+    /// base level with NEAREST and the clamp [0, 0.25] (VkSamplerCreateInfo,
+    /// "Mapping of OpenGL to Vulkan filter modes"; the reference host
+    /// the reference host.Graphics.Vulkan/SamplerHolder.cs:23-27 does the same).
+    fn host(self, clamp: [f32; 2]) -> (vk::SamplerMipmapMode, [f32; 2]) {
+        match self {
+            Self::BaseLevel => (vk::SamplerMipmapMode::NEAREST, [0.0, 0.25]),
+            Self::Nearest => (vk::SamplerMipmapMode::NEAREST, clamp),
+            Self::Linear => (vk::SamplerMipmapMode::LINEAR, clamp),
+        }
+    }
 }
 
 /// Every numeric correspondence is supplied and classified by the host.
@@ -84,7 +143,7 @@ pub struct SamplerEnums {
     pub compare_modes: Vec<EnumRule<bool>>,
     /// Caller comparison function tokens mapped to Vulkan comparisons.
     pub compare_functions: Vec<EnumRule<vk::CompareOp>>,
-    /// Opt into anisotropy and device feature checks.
+    /// Opt into the observed anisotropy float and device feature checks.
     pub anisotropy: bool,
     /// Select integer rather than float fixed border colors.
     pub integer_border: bool,
@@ -97,16 +156,14 @@ impl SamplerEnums {
         validate_rules(&self.wraps)?;
         validate_rules(&self.compare_modes)?;
         validate_rules(&self.compare_functions)?;
-        if self.min_filters.iter().any(|r| {
-            !matches!(r.host.texel, vk::Filter::NEAREST | vk::Filter::LINEAR)
-                || !matches!(
-                    r.host.mip,
-                    vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
-                )
-        }) || self
-            .mag_filters
+        if self
+            .min_filters
             .iter()
-            .any(|r| !matches!(r.host, vk::Filter::NEAREST | vk::Filter::LINEAR))
+            .any(|r| !matches!(r.host.texel, vk::Filter::NEAREST | vk::Filter::LINEAR))
+            || self
+                .mag_filters
+                .iter()
+                .any(|r| !matches!(r.host, vk::Filter::NEAREST | vk::Filter::LINEAR))
             || self.wraps.iter().any(|r| {
                 !matches!(
                     r.host,
@@ -114,6 +171,7 @@ impl SamplerEnums {
                         | vk::SamplerAddressMode::MIRRORED_REPEAT
                         | vk::SamplerAddressMode::CLAMP_TO_EDGE
                         | vk::SamplerAddressMode::CLAMP_TO_BORDER
+                        | vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE
                 )
             })
             || self
@@ -138,7 +196,7 @@ pub struct TextureContract {
     pub bindings: Vec<TextureMapping>,
     /// Explicit mappings from recorded image slots to bound surface slots.
     pub surfaces: Vec<SurfaceMapping>,
-    /// Evidence-tagged sampler rules; when absent, use the default host choices.
+    /// Evidence-tagged sampler rules; when absent, use the legacy host choices.
     pub enums: Option<SamplerEnums>,
     /// Explicit mapping from caller filter tokens to Vulkan filters.
     pub filters: Vec<(u64, vk::Filter)>,
@@ -151,6 +209,8 @@ pub struct TextureContract {
     /// Explicit combined-handle interpretation: handle, texture id, sampler id.
     /// Separate handles returned by this library use registration ids.
     pub combined: Vec<(u64, u32, u32)>,
+    /// Where the caller binds each stage's bindless textures, by location.
+    pub locations: Vec<LocationMapping>,
 }
 impl TextureContract {
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -192,6 +252,27 @@ impl TextureContract {
         if self.combined.iter().any(|(h, _, _)| !handles.insert(*h)) {
             return Err("duplicate combined texture handle".into());
         }
+        let mut stages = HashSet::new();
+        for l in &self.locations {
+            let span = l.base
+                ..l.base
+                    .checked_add(LOCATION_SPAN)
+                    .ok_or("location indices overflow")?;
+            if !stages.insert(l.target)
+                || self
+                    .bindings
+                    .iter()
+                    .any(|m| m.stage == l.stage && span.contains(&m.index))
+                || self.locations.iter().any(|o| {
+                    o.target != l.target
+                        && o.stage == l.stage
+                        && o.base < span.end
+                        && span.start < o.base.saturating_add(LOCATION_SPAN)
+                })
+            {
+                return Err("duplicate location mapping, or one over bound texture indices".into());
+            }
+        }
         Ok(())
     }
 }
@@ -199,7 +280,7 @@ impl TextureContract {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Binding {
     /// Translated shader stage.
-    pub stage: UniformStage,
+    pub stage: GraphicsStage,
     /// Descriptor set in the translated module.
     pub set: u32,
     /// Descriptor binding number in the translated module.
@@ -218,18 +299,20 @@ impl Binding {
     }
     /// Return the descriptor set used for this stage in the graphics pipeline.
     pub fn stage_set(self) -> u32 {
-        self.stage.set() + 2
+        self.stage.texture_set()
     }
 }
 
 /// Reflect separate float images, samplers and storage images with their
 /// image view shapes.
 ///
-/// Sampled images live in sets 0 and 1 below binding 256. Storage images
+/// Sampled images and samplers live in set 1 below binding 256 (bound
+/// textures) and in set 0 at any binding (bindless textures; the shader translator
+/// places them from 4096). Storage images
 /// (guest surfaces) live in set 0 (bindless views) and set 2 (bound views
 /// and their aliases); their bindings only need to stay distinct once the
 /// sets are flattened into the stage's one descriptor set.
-pub(crate) fn bindings(words: &[u32], stage: UniformStage) -> Result<Vec<Binding>, String> {
+pub(crate) fn bindings(words: &[u32], stage: GraphicsStage) -> Result<Vec<Binding>, String> {
     let reflected = stage_bindings(words, stage.model())?;
     let instructions = instructions(words)?;
     for &(op, args) in &instructions {
@@ -261,9 +344,11 @@ pub(crate) fn bindings(words: &[u32], stage: UniformStage) -> Result<Vec<Binding
         .filter(|b| b.descriptor_type != vk::DescriptorType::UNIFORM_BUFFER)
         .map(|b| {
             let placed = match b.descriptor_type {
-                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::SAMPLER => {
-                    b.set <= 1 && b.binding < 256
-                }
+                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::SAMPLER => match b.set {
+                    0 => true,
+                    1 => b.binding < 256,
+                    _ => false,
+                },
                 vk::DescriptorType::STORAGE_IMAGE => matches!(b.set, 0 | 2),
                 _ => false,
             };
@@ -272,7 +357,17 @@ pub(crate) fn bindings(words: &[u32], stage: UniformStage) -> Result<Vec<Binding
                 .checked_mul(256)
                 .and_then(|s| s.checked_add(b.binding));
             if !placed || b.count != 1 || !flat.is_some_and(|flat| lowered.insert(flat)) {
-                return Err("unsupported draw texture descriptor".into());
+                return Err(format!(
+                    "unsupported draw texture descriptor: {} at set {} binding {}",
+                    match b.descriptor_type {
+                        vk::DescriptorType::SAMPLED_IMAGE => "sampled image",
+                        vk::DescriptorType::SAMPLER => "sampler",
+                        vk::DescriptorType::STORAGE_IMAGE => "storage image",
+                        _ => "descriptor",
+                    },
+                    b.set,
+                    b.binding
+                ));
             }
             let mut image_kind = None;
             let mut arrayed = false;
@@ -348,8 +443,55 @@ pub(crate) struct SamplerKey {
     mipmap: i32,
     compare: Option<i32>,
     anisotropy: u32,
-    border: i32,
+    border: Border,
 }
+
+/// What a sampler returns for coordinates outside the texture. Provenance:
+/// the reference host `SamplerHolder` (MIT), which uses a fixed Vulkan border colour on
+/// an exact match and a custom one otherwise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Border {
+    /// No address mode samples the border, so its colour is never read.
+    Unsampled,
+    /// One of Vulkan's fixed border colours, matched bit for bit.
+    Fixed(vk::BorderColor),
+    /// A float colour no fixed border colour states, as each component's
+    /// bits; it needs the device's custom border colours.
+    Custom([u32; 4]),
+}
+
+impl std::fmt::Debug for Border {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsampled => f.write_str("Unsampled"),
+            Self::Fixed(color) => write!(f, "Fixed({})", color.as_raw()),
+            Self::Custom(bits) => write!(f, "Custom({:?})", bits.map(f32::from_bits)),
+        }
+    }
+}
+
+impl Border {
+    fn new(color: [f32; 4], integer: bool, sampled: bool) -> Option<Self> {
+        const ZERO: u32 = 0;
+        const ONE: u32 = 0x3f80_0000;
+        if !sampled {
+            return Some(Self::Unsampled);
+        }
+        let bits = color.map(f32::to_bits);
+        let fixed = match (bits, integer) {
+            ([ZERO, ZERO, ZERO, ZERO], false) => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ([ZERO, ZERO, ZERO, ONE], false) => vk::BorderColor::FLOAT_OPAQUE_BLACK,
+            ([ONE, ONE, ONE, ONE], false) => vk::BorderColor::FLOAT_OPAQUE_WHITE,
+            ([ZERO, ZERO, ZERO, ZERO], true) => vk::BorderColor::INT_TRANSPARENT_BLACK,
+            ([ZERO, ZERO, ZERO, ONE], true) => vk::BorderColor::INT_OPAQUE_BLACK,
+            ([ONE, ONE, ONE, ONE], true) => vk::BorderColor::INT_OPAQUE_WHITE,
+            (bits, false) => return Some(Self::Custom(bits)),
+            (_, true) => return None,
+        };
+        Some(Self::Fixed(fixed))
+    }
+}
+
 impl SamplerKey {
     /// Create a checked sampler interpretation or Vulkan sampler; return None for unsupported state.
     pub fn new(d: &SamplerDescription, c: &TextureContract) -> Option<Self> {
@@ -363,56 +505,47 @@ impl SamplerKey {
         {
             return None;
         }
-        let (min, mag, mipmap, compare, anisotropy, integer_border) = if let Some(enums) = &c.enums
-        {
-            let min = enum_value(&enums.min_filters, d.min_filter)?;
-            let compare = if enum_value(&enums.compare_modes, d.compare_mode)? {
-                Some(enum_value(&enums.compare_functions, d.compare_func)?.as_raw())
+        let (min, mag, (mipmap, lod_clamp), compare, anisotropy, integer_border) =
+            if let Some(enums) = &c.enums {
+                let min = enum_value(&enums.min_filters, d.min_filter)?;
+                let compare = if enum_value(&enums.compare_modes, d.compare_mode)? {
+                    Some(enum_value(&enums.compare_functions, d.compare_func)?.as_raw())
+                } else {
+                    None
+                };
+                if !enums.anisotropy && d.max_anisotropy != 1.0 {
+                    return None;
+                }
+                (
+                    min.texel,
+                    enum_value(&enums.mag_filters, d.mag_filter)?,
+                    min.mip.host(d.lod_clamp),
+                    compare,
+                    d.max_anisotropy,
+                    enums.integer_border,
+                )
             } else {
-                None
+                if d.compare_mode != c.compare_disabled
+                    || d.max_anisotropy != 1.0
+                    || d.border_color != [0.0; 4]
+                {
+                    return None;
+                }
+                (
+                    mapped(&c.filters, d.min_filter)?,
+                    mapped(&c.filters, d.mag_filter)?,
+                    (c.lod.unwrap_or(vk::SamplerMipmapMode::NEAREST), d.lod_clamp),
+                    None,
+                    1.0,
+                    false,
+                )
             };
-            if !enums.anisotropy && d.max_anisotropy != 1.0 {
-                return None;
-            }
-            (
-                min.texel,
-                enum_value(&enums.mag_filters, d.mag_filter)?,
-                min.mip,
-                compare,
-                d.max_anisotropy,
-                enums.integer_border,
-            )
-        } else {
-            if d.compare_mode != c.compare_disabled
-                || d.max_anisotropy != 1.0
-                || d.border_color != [0.0; 4]
-            {
-                return None;
-            }
-            (
-                mapped(&c.filters, d.min_filter)?,
-                mapped(&c.filters, d.mag_filter)?,
-                c.lod.unwrap_or(vk::SamplerMipmapMode::NEAREST),
-                None,
-                1.0,
-                false,
-            )
-        };
         if ![min, mag]
             .iter()
             .all(|v| matches!(*v, vk::Filter::NEAREST | vk::Filter::LINEAR))
         {
             return None;
         }
-        let border = match (d.border_color, integer_border) {
-            ([0.0, 0.0, 0.0, 0.0], false) => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
-            ([0.0, 0.0, 0.0, 1.0], false) => vk::BorderColor::FLOAT_OPAQUE_BLACK,
-            ([1.0, 1.0, 1.0, 1.0], false) => vk::BorderColor::FLOAT_OPAQUE_WHITE,
-            ([0.0, 0.0, 0.0, 0.0], true) => vk::BorderColor::INT_TRANSPARENT_BLACK,
-            ([0.0, 0.0, 0.0, 1.0], true) => vk::BorderColor::INT_OPAQUE_BLACK,
-            ([1.0, 1.0, 1.0, 1.0], true) => vk::BorderColor::INT_OPAQUE_WHITE,
-            _ => return None,
-        };
         let mut wrap = [0; 3];
         for (i, token) in d.wrap.iter().enumerate() {
             let value = if let Some(enums) = &c.enums {
@@ -426,24 +559,30 @@ impl SamplerKey {
                     | vk::SamplerAddressMode::MIRRORED_REPEAT
                     | vk::SamplerAddressMode::CLAMP_TO_EDGE
                     | vk::SamplerAddressMode::CLAMP_TO_BORDER
+                    | vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE
             ) {
                 return None;
             }
             wrap[i] = value.as_raw();
         }
+        let border = Border::new(
+            d.border_color,
+            integer_border,
+            wrap.contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER.as_raw()),
+        )?;
         Some(Self {
             min: min.as_raw(),
             mag: mag.as_raw(),
             wrap,
             lod: [
-                d.lod_clamp[0].to_bits(),
-                d.lod_clamp[1].to_bits(),
+                lod_clamp[0].to_bits(),
+                lod_clamp[1].to_bits(),
                 d.lod_bias.to_bits(),
             ],
             mipmap: mipmap.as_raw(),
             compare,
             anisotropy: anisotropy.to_bits(),
-            border: border.as_raw(),
+            border,
         })
     }
 }
@@ -455,6 +594,45 @@ pub(crate) struct Sampler {
     /// Owned Vulkan sampler handle.
     pub handle: vk::Sampler,
 }
+impl SamplerKey {
+    /// Whether the sampler filters or blends mip levels linearly, which
+    /// needs the texture's format to filter linearly. Source: the public contract.
+    pub(crate) fn filters_linearly(&self) -> bool {
+        self.min == vk::Filter::LINEAR.as_raw()
+            || self.mag == vk::Filter::LINEAR.as_raw()
+            || self.mipmap == vk::SamplerMipmapMode::LINEAR.as_raw()
+    }
+
+    /// Whether an axis mirrors the texture once and then clamps to its edge,
+    /// which needs the device's samplerMirrorClampToEdge feature.
+    pub(crate) fn mirrors_once(&self) -> bool {
+        self.wrap
+            .contains(&vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE.as_raw())
+    }
+
+    /// The custom border colour the sampler samples, which needs the
+    /// device's custom border colours.
+    pub(crate) fn custom_border(&self) -> Option<[f32; 4]> {
+        match self.border {
+            Border::Custom(bits) => Some(bits.map(f32::from_bits)),
+            Border::Unsampled | Border::Fixed(_) => None,
+        }
+    }
+}
+
+/// Whether the device samples with MIRROR_CLAMP_TO_EDGE. SwXBx enables the
+/// Vulkan 1.2 feature whenever the device has it.
+pub(crate) fn mirror_clamp_to_edge(context: &Context) -> bool {
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
+    unsafe {
+        context
+            .instance
+            .get_physical_device_features2(context.physical_device, &mut features)
+    };
+    v12.sampler_mirror_clamp_to_edge != vk::FALSE
+}
+
 impl Sampler {
     /// Create a checked sampler interpretation or Vulkan sampler; return None for unsupported state.
     pub fn new(context: &Arc<Context>, key: SamplerKey) -> Option<Self> {
@@ -465,6 +643,9 @@ impl Sampler {
         }
         .limits;
         if f32::from_bits(key.lod[2]).abs() > limits.max_sampler_lod_bias {
+            return None;
+        }
+        if key.mirrors_once() && !mirror_clamp_to_edge(context) {
             return None;
         }
         let anisotropy = f32::from_bits(key.anisotropy);
@@ -478,31 +659,52 @@ impl Sampler {
         {
             return None;
         }
-        let handle = unsafe {
-            context
-                .device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .min_filter(vk::Filter::from_raw(key.min))
-                        .mag_filter(vk::Filter::from_raw(key.mag))
-                        .mipmap_mode(vk::SamplerMipmapMode::from_raw(key.mipmap))
-                        .address_mode_u(vk::SamplerAddressMode::from_raw(key.wrap[0]))
-                        .address_mode_v(vk::SamplerAddressMode::from_raw(key.wrap[1]))
-                        .address_mode_w(vk::SamplerAddressMode::from_raw(key.wrap[2]))
-                        .border_color(vk::BorderColor::from_raw(key.border))
-                        .compare_enable(key.compare.is_some())
-                        .compare_op(
-                            key.compare
-                                .map_or(vk::CompareOp::ALWAYS, vk::CompareOp::from_raw),
-                        )
-                        .anisotropy_enable(anisotropy > 1.0)
-                        .max_anisotropy(anisotropy)
-                        .min_lod(f32::from_bits(key.lod[0]))
-                        .max_lod(f32::from_bits(key.lod[1]))
-                        .mip_lod_bias(f32::from_bits(key.lod[2])),
-                    None,
-                )
-                .ok()?
+        let mut custom = vk::SamplerCustomBorderColorCreateInfoEXT::default();
+        let border = match key.border {
+            Border::Unsampled => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            Border::Fixed(color) => color,
+            Border::Custom(bits) => {
+                context.custom_border_colors.reserve()?;
+                // The device samples custom colours without a format, so the
+                // colour holds for every view the sampler meets.
+                custom = custom.custom_border_color(vk::ClearColorValue {
+                    float32: bits.map(f32::from_bits),
+                });
+                vk::BorderColor::FLOAT_CUSTOM_EXT
+            }
+        };
+        let mut info = vk::SamplerCreateInfo::default();
+        if let Border::Custom(_) = key.border {
+            info = info.push_next(&mut custom);
+        }
+        let created = unsafe {
+            context.device.create_sampler(
+                &info
+                    .min_filter(vk::Filter::from_raw(key.min))
+                    .mag_filter(vk::Filter::from_raw(key.mag))
+                    .mipmap_mode(vk::SamplerMipmapMode::from_raw(key.mipmap))
+                    .address_mode_u(vk::SamplerAddressMode::from_raw(key.wrap[0]))
+                    .address_mode_v(vk::SamplerAddressMode::from_raw(key.wrap[1]))
+                    .address_mode_w(vk::SamplerAddressMode::from_raw(key.wrap[2]))
+                    .border_color(border)
+                    .compare_enable(key.compare.is_some())
+                    .compare_op(
+                        key.compare
+                            .map_or(vk::CompareOp::ALWAYS, vk::CompareOp::from_raw),
+                    )
+                    .anisotropy_enable(anisotropy > 1.0)
+                    .max_anisotropy(anisotropy)
+                    .min_lod(f32::from_bits(key.lod[0]))
+                    .max_lod(f32::from_bits(key.lod[1]))
+                    .mip_lod_bias(f32::from_bits(key.lod[2])),
+                None,
+            )
+        };
+        let Ok(handle) = created else {
+            if let Border::Custom(_) = key.border {
+                context.custom_border_colors.release();
+            }
+            return None;
         };
         Some(Self {
             context: context.clone(),
@@ -515,6 +717,9 @@ impl Drop for Sampler {
     fn drop(&mut self) {
         unsafe {
             self.context.device.destroy_sampler(self.handle, None);
+        }
+        if let Border::Custom(_) = self.key.border {
+            self.context.custom_border_colors.release();
         }
     }
 }

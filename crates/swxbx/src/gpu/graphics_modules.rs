@@ -1,6 +1,6 @@
-//! Retained worker-owned shader modules.
+//! Retained worker-owned shader modules. Evidence: the public contract.
 use super::{
-    uniforms::{self, UniformStage},
+    uniforms::{self, GraphicsStage},
     Context,
 };
 use ash::vk;
@@ -12,7 +12,7 @@ use std::{
 #[derive(Hash, PartialEq, Eq)]
 struct Key {
     words: Vec<u32>,
-    stage: UniformStage,
+    stage: GraphicsStage,
     storage: bool,
 }
 
@@ -35,7 +35,7 @@ impl ShaderModules {
         &self,
         context: &Arc<Context>,
         words: &[u32],
-        stage: UniformStage,
+        stage: GraphicsStage,
         storage: bool,
     ) -> Result<Arc<ShaderModule>, String> {
         let key = Key {
@@ -68,7 +68,7 @@ mod tests {
     #[ignore = "requires a graphics device; never skips"]
     fn modules_survive_users_and_separate_storage_choices() {
         let context = Arc::new(Context::new().expect("graphics context"));
-        // Empty vertex entry point using public instruction encodings.
+        // Original empty vertex entry point using public instruction encodings.
         let mut words = vec![0x0723_0203, 0x0001_0300, 0, 5, 0];
         for (op, args) in [
             (17, vec![1]),
@@ -86,20 +86,20 @@ mod tests {
         }
         let cache = ShaderModules::default();
         let first = cache
-            .get(&context, &words, UniformStage::Vertex, false)
+            .get(&context, &words, GraphicsStage::Vertex, false)
             .unwrap();
         let retained = Arc::downgrade(&first);
         drop(first);
         let second = cache
-            .get(&context, &words, UniformStage::Vertex, false)
+            .get(&context, &words, GraphicsStage::Vertex, false)
             .unwrap();
         assert!(Arc::ptr_eq(&retained.upgrade().unwrap(), &second));
         let storage = cache
-            .get(&context, &words, UniformStage::Vertex, true)
+            .get(&context, &words, GraphicsStage::Vertex, true)
             .unwrap();
         assert!(!Arc::ptr_eq(&second, &storage));
         assert!(cache
-            .get(&context, &[], UniformStage::Vertex, false)
+            .get(&context, &[], GraphicsStage::Vertex, false)
             .is_err());
         drop(cache);
         assert!(retained.upgrade().is_some());

@@ -1,5 +1,6 @@
 //! Textures, texture views, samplers, the pools that register them, and
-//! programs.
+//! programs. Signatures: docs/signatures/0001-setup.md, 0003-objects.md,
+//! 0004-pointers.md.
 
 use super::{
     objects::{Object, SamplerDescription, ShaderRecord, ShaderTranslation, TextureDescription},
@@ -11,7 +12,7 @@ use std::fs;
 use super::program_memory::{GuestProgram, ProgramMemory, ProgramRead, SHADER_CODE_OFFSET};
 
 /// The translator's input for the program at `gpu_address`, read once.
-fn shader_bytes(
+pub(super) fn shader_bytes(
     instance: &crate::instance::InstanceState,
     gpu_address: u64,
 ) -> Result<Vec<u8>, ProgramRead> {
@@ -62,9 +63,29 @@ pub(crate) fn retry_pending(
             instance.fail_pending_shader(program, entry.record_index);
             continue;
         };
-        let Some(translator) = instance.shader_translator() else {
+        let Some(translator) = instance.program_translator(program) else {
             continue;
         };
+        if translator.translation_needs(SHADER_STAGE_UNKNOWN, &program_bytes)
+            == crate::startup_cache::TranslationNeeds::InputPrimitive
+        {
+            instance.replace_pending_shader(program, entry.record_index);
+            instance.record_late_read(point);
+            let translation =
+                ShaderTranslation::ByInputPrimitive(std::sync::Arc::new(program_bytes));
+            instance.objects.update(program, |object| {
+                if let Object::Program {
+                    shader_translations,
+                    ..
+                } = object
+                {
+                    if let Some(slot) = shader_translations.get_mut(entry.record_index) {
+                        *slot = translation;
+                    }
+                }
+            });
+            continue;
+        }
         if let Some(translation) = instance.request_cached_translation(&program_bytes) {
             instance.replace_pending_shader(program, entry.record_index);
             instance.record_late_read(point);
@@ -173,6 +194,7 @@ mod tests {
                 requires_demote_to_helper_invocation: true,
                 requires_maximal_reconvergence: true,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             })
         }
     }
@@ -248,9 +270,9 @@ mod tests {
                 ..Default::default()
             })
         };
-        instance.set_shader_translator(Some(Arc::new(FakeTranslator(Arc::new(Mutex::new(
-            Vec::new(),
-        ))))));
+        let translator: Arc<dyn ShaderTranslator> =
+            Arc::new(FakeTranslator(Arc::new(Mutex::new(Vec::new()))));
+        instance.set_program_translator(9, translator);
         instance.objects.put(
             9,
             Object::Program {
@@ -400,6 +422,7 @@ fn translate_shaders(
     let Some(translator) = instance.shader_translator() else {
         return Vec::new();
     };
+    instance.set_program_translator(program, std::sync::Arc::clone(&translator));
     records
         .iter()
         .enumerate()
@@ -438,6 +461,13 @@ fn translate_shaders(
                     return super::objects::ShaderTranslation::Error(error.message().into());
                 }
             };
+            if translator.translation_needs(SHADER_STAGE_UNKNOWN, &code)
+                == crate::startup_cache::TranslationNeeds::InputPrimitive
+            {
+                return super::objects::ShaderTranslation::ByInputPrimitive(std::sync::Arc::new(
+                    code,
+                ));
+            }
             if let Some(translation) = instance.request_cached_translation(&code) {
                 return translation;
             }
@@ -581,8 +611,8 @@ fn texture_field(
 
 /// How much pool storage a texture needs, by swxbx's own reckoning.
 ///
-/// The answer depends on the format and its tiling. Four bytes per texel per
-/// level, with each
+/// The real implementation's answer depends on the format and its tiling,
+/// neither of which is known. Four bytes per texel per level, with each
 /// level at least one texel, is enough for every format a Vulkan
 /// implementation would store uncompressed at 32 bits, and never smaller
 /// than what the program will later read or write through the pool.
@@ -598,7 +628,7 @@ fn storage_size(description: &TextureDescription) -> u64 {
     total.next_multiple_of(STORAGE_ALIGNMENT)
 }
 
-/// Conservative storage alignment used by the host contract.
+/// The largest alignment the real implementation was seen to ask for.
 const STORAGE_ALIGNMENT: u64 = 0x10000;
 
 /// Return the handler for a supported name in this command family.
@@ -753,7 +783,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         "nvnTextureGetLevels" => {
             |instance, _, registers| texture_answer(instance, registers, |t| t.levels)
         }
-        // Multisample textures are not part of this bounded contract.
+        // Observed to answer 0 for every texture the program asked about.
         "nvnTextureGetSamples" => {
             |instance, _, registers| texture_answer(instance, registers, |_| 0)
         }
@@ -841,7 +871,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         },
         // The program asks how much memory a depth texture's culling data
         // needs and later saves and restores it. SwXBx keeps none, so the
-        // minimum allocation preserves the program's layout.
+        // smallest observed answer is enough to keep the program's layout.
         "nvnTextureGetZCullStorageSize" => |_instance, _, registers| {
             registers.x[0] = 0x100;
             Status::Ok
@@ -999,9 +1029,9 @@ pub fn handler(name: &str) -> Option<Handler> {
             );
             succeed(registers)
         },
-        // The record has two GPU-shaped values, but the host contract does not
-        // identify the code value or establish a code size. Retain both values
-        // and the opaque words for deferred translation.
+        // The record has two GPU-shaped values, but observation does not
+        // identify the code value or establish a code size. Keep both and
+        // the observed words until that gap is closed.
         "nvnProgramSetShaders" => |instance, _, registers| {
             instance.clear_pending_shaders(registers.x[0]);
             let count = registers.x[1].min(8);

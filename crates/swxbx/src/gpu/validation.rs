@@ -1,4 +1,4 @@
-//! Strict Vulkan validation for synthetic tests.
+//! Strict Vulkan validation for synthetic tests. Source: the public contract.
 
 use ash::{vk, Entry, Instance};
 use std::{

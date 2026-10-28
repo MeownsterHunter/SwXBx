@@ -1,4 +1,4 @@
-//! Vulkan global-memory checks.
+//! Own Vulkan experiments. Provenance: the documented contract
 
 #![cfg(feature = "vulkan")]
 

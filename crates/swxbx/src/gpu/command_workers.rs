@@ -1,4 +1,4 @@
-//! Worker-local pools and ordered queue ownership.
+//! Worker-local pools and ordered queue ownership. Source: the public contract.
 use super::recording_device::Operation;
 use ash::vk;
 #[cfg(test)]
@@ -853,7 +853,7 @@ mod tests {
                             } else {
                                 [0.0, 0.0, 1.0, 1.0]
                             };
-                            assert!(backend.clear_color(1, color, 15));
+                            assert!(backend.clear_color(1, color, 15).is_ok());
                             backend.enqueue_callback(index % 2, 1, 4, 4).unwrap();
                         }
                         let retained = commands.submission().unwrap();

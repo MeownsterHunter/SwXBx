@@ -7,8 +7,16 @@ pub(super) fn record(
     registers: &mut Registers,
     command: RecordedCommand,
 ) -> Status {
-    if !instance.objects.record_command(registers.x[0], command) {
-        return Status::BadArgument;
+    // A command the buffer's facts refuse is not recorded; the call
+    // returns why. Source: the public contract.
+    if let Err(status) =
+        instance
+            .objects
+            .record_command(registers.x[0], command, |facts, command| {
+                facts.admit(instance, command)
+            })
+    {
+        return status;
     }
     let _ = function;
     // Recorded commands return nothing swxbx knows of. The result
@@ -78,8 +86,9 @@ pub fn handler(name: &str) -> Option<Handler> {
                 },
             )
         },
-        // The host contract defines x1 as the source GPU address and x2 as
-        // the destination texture. The remaining pointers stay opaque.
+        // The register observations establish x1 as the source GPU address
+        // and x2 as the destination texture. The remaining pointers are
+        // intentionally not interpreted; see signatures 0006.
         "nvnCommandBufferCopyBufferToTexture" => |instance, _, r| {
             record(
                 instance,
@@ -155,7 +164,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                     index_type: r.x[2] as u32,
                     count: r.x[3] as u32,
                     indices: r.x[4],
-                    // Signed low word is the host experiment's interpretation.
+                    // Signed low word is the host experiment's interpretation. Source: the public contract.
                     base_vertex: r.x[5] as i32,
                 },
             )
@@ -168,8 +177,9 @@ pub fn handler(name: &str) -> Option<Handler> {
                 RecordedCommand::SetDepthRange([r.x[1], r.d[0], r.d[1]]),
             )
         },
-        // Retain the command for a later executor, but report it as unimplemented
-        // so the host can apply its fallback policy.
+        // Kept for a later executor, but reported as not implemented: the
+        // host then treats the call exactly as before this handler existed,
+        // which a program was seen to depend on (note 0012).
         _ => |instance, function, r| {
             let _ = record(
                 instance,

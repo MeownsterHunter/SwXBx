@@ -1,4 +1,4 @@
-//! Fixed subgroup requirements from public stage limits.
+//! Fixed subgroup requirements from public stage limits. Evidence: the public contract.
 use ash::vk;
 
 /// Enabled device controls and limits for translated subgroup operations.

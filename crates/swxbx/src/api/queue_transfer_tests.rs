@@ -64,6 +64,8 @@ fn submission_uses_host_notifications_and_exact_device_writeback() {
         condition_zero: 2,
         compute_stage: 5,
         compute_buffers: vec![],
+        compute_texel_buffers: vec![],
+        compute_texel_location_base: None,
         clear: None
     })));
     assert_eq!(

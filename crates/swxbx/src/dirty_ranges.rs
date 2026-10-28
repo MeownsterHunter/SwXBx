@@ -1,4 +1,4 @@
-//! Coalesced half-open byte ranges.
+//! Coalesced half-open byte ranges. Source: the public contract.
 use std::{collections::BTreeMap, ops::Range};
 
 #[derive(Default, Debug)]

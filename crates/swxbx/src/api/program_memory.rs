@@ -1,9 +1,10 @@
 //! One guest program read from program memory: its shader header, its code up
 //! to the compiler's end marker, and the constant data that follows the code.
 //! Parsed once here; the translator receives the result as one record.
+//! Layout sources: the public contract and 0046.
 
-/// Program data starts with a magic word that selects the layout:
-/// 0x12345678 is a graphics program
+/// Program data starts with a magic word that selects the layout (observed
+/// on a real program, the public contract): 0x12345678 is a graphics program
 /// with the 80-byte shader header at +0x30 and code at +0x80; 0x12345679 is
 /// a compute program with no header and code at +0x100. The translator gets
 /// the header followed by the code; a compute program gets an all-zero
@@ -19,7 +20,8 @@ const SHADER_HEADER_SIZE: usize = SHADER_CODE_OFFSET - SHADER_PREFIX;
 /// 64 KiB constant-bank-sized window.
 const MAX_SHADER_BYTES: usize = 64 * 1024;
 
-/// A scheduling word followed by three instruction slots.
+/// A scheduling word followed by three instruction slots
+/// (the reference host Decoders/Decoder.cs:265-270, MIT).
 const BUNDLE: usize = 32;
 const WORD: usize = 8;
 
@@ -27,7 +29,7 @@ const WORD: usize = 8;
 /// (Mesa src/nouveau/vulkan/nvk_physical_device.h:62-65).
 const CONSTANT_BUFFER_ALIGNMENT: u64 = 256;
 
-/// Extended translator program record:
+/// the shader translator's extended program record (its the documented contract):
 /// header, code, cb1 bytes, then three little-endian u64 lengths and this tag.
 const RECORD_TAG: &[u8; 16] = b"SBXCB1RECORD0001";
 
@@ -74,9 +76,9 @@ pub(super) struct GuestProgram {
     constant_buffer1: Vec<u8>,
 }
 
-/// The program's end: an unconditional branch whose target is itself. Targets
-/// are relative to the next slot; a target on a scheduling word lands on the
-/// first slot after it.
+/// The program's end: an unconditional BRA whose target is itself. Targets
+/// are relative to the next slot (the reference host Decoders/InstOp.cs:22-25); a target
+/// on a scheduling word lands on the first slot after it.
 fn ends_program(word: u64, slot_address: usize) -> bool {
     let bra = word >> 52 == 0xe24;
     let always = (word >> 16) & 0xf == 7 && word & 0x1f == 0xf;

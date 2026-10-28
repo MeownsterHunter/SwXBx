@@ -1,5 +1,7 @@
-//! Per-buffer recording ownership and immutable publication.
-use super::objects::RecordedCommand;
+//! Per-buffer recording ownership and immutable publication. Source: the public contract.
+//! A command is admitted by its buffer's facts before it is kept. Source: the public contract.
+use super::{misuse::Facts, objects::RecordedCommand};
+use crate::Status;
 use arc_swap::ArcSwap;
 use std::{
     cell::RefCell,
@@ -20,6 +22,7 @@ struct State {
     open: bool,
     sequence: u64,
     commands: Vec<RecordedCommand>,
+    facts: Facts,
 }
 #[derive(Debug)]
 struct Published {
@@ -191,6 +194,7 @@ impl Recordings {
                 e.access(|state| {
                     state.open = true;
                     state.commands.clear();
+                    state.facts = Facts::default();
                     let recycled = e.recycled.swap(ptr::null_mut(), Ordering::AcqRel);
                     if !recycled.is_null() {
                         let recycled = *unsafe { Box::from_raw(recycled) };
@@ -202,17 +206,26 @@ impl Recordings {
             })
             .is_some()
     }
-    pub fn push(&self, address: u64, command: RecordedCommand) -> bool {
+    /// Keep a command the buffer's facts admit. A refused command is not
+    /// kept; a contended buffer is a bad argument.
+    pub fn push(
+        &self,
+        address: u64,
+        command: RecordedCommand,
+        admit: impl FnOnce(&mut Facts, &RecordedCommand) -> Result<(), Status>,
+    ) -> Result<(), Status> {
         self.with_entry(address, |entry| {
             entry
                 .access(|state| {
                     if state.open {
+                        admit(&mut state.facts, &command)?;
                         state.commands.push(command);
                     }
+                    Ok(())
                 })
-                .is_some()
+                .unwrap_or(Err(Status::BadArgument))
         })
-        .unwrap_or(true)
+        .unwrap_or(Ok(()))
     }
     pub fn end(&self, address: u64) -> Option<u64> {
         let entry = self.entry(address)?;
@@ -274,19 +287,31 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Arc};
 
+    fn keep(recordings: &Recordings, address: u64, command: RecordedCommand) -> bool {
+        recordings.push(address, command, |_, _| Ok(())).is_ok()
+    }
+
     #[test]
     fn completed_capacity_returns_without_claiming_active_recording() {
         let recordings = Recordings::default();
         recordings.initialize(0x1000);
         assert!(recordings.begin(0x1000));
         for _ in 0..1024 {
-            assert!(recordings.push(0x1000, RecordedCommand::SetViewport([0; 5])));
+            assert!(keep(
+                &recordings,
+                0x1000,
+                RecordedCommand::SetViewport([0; 5])
+            ));
         }
         let handle = recordings.end(0x1000).unwrap();
         let commands = recordings.take(handle).unwrap();
         let storage = commands.as_ptr();
         assert!(recordings.begin(0x1000));
-        assert!(recordings.push(0x1000, RecordedCommand::SetViewport([1; 5])));
+        assert!(keep(
+            &recordings,
+            0x1000,
+            RecordedCommand::SetViewport([1; 5])
+        ));
         recordings.recycle(handle, commands);
         let next = recordings.end(0x1000).unwrap();
         assert_eq!(
@@ -312,9 +337,11 @@ mod tests {
                 scope.spawn(move || {
                     assert!(recordings.begin(key));
                     for value in 0..4096 {
-                        assert!(
-                            recordings.push(key, RecordedCommand::SetDepthRange([key, value, 0]))
-                        );
+                        assert!(keep(
+                            recordings,
+                            key,
+                            RecordedCommand::SetDepthRange([key, value, 0])
+                        ));
                     }
                 });
             }
@@ -366,7 +393,11 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(recordings.begin(1));
-        assert!(recordings.push(1, RecordedCommand::SetDepthRange([1, 2, 3])));
+        assert!(keep(
+            &recordings,
+            1,
+            RecordedCommand::SetDepthRange([1, 2, 3])
+        ));
         recordings.finalize(1);
         recordings.initialize(1);
         assert!(recordings.begin(1));
@@ -380,7 +411,11 @@ mod tests {
         let recordings = Recordings::default();
         recordings.initialize(1);
         assert!(recordings.begin(1));
-        assert!(recordings.push(1, RecordedCommand::SetDepthRange([1, 2, 3])));
+        assert!(keep(
+            &recordings,
+            1,
+            RecordedCommand::SetDepthRange([1, 2, 3])
+        ));
         let old = recordings.end(1).unwrap();
         assert!(recordings.begin(1));
         let (entered, entry) = mpsc::sync_channel(1);

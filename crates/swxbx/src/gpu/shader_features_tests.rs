@@ -1,4 +1,4 @@
-//! Synthetic feature checks.
+//! Original synthetic feature checks. Evidence: the public contract.
 use super::{
     graphics::{
         Draw, DrawPipelineState, DrawVertices, PendingDraw, PrimitiveTopology, VertexAttribute,
@@ -104,6 +104,7 @@ fn declared_requirements_are_checked_even_without_instruction_markers() {
         requires_demote_to_helper_invocation: true,
         requires_maximal_reconvergence: false,
         surfaces: Vec::new(),
+        textures: Vec::new(),
     };
     assert_eq!(
         ShaderFeatures::default().validate_translated_shader(&shader),
@@ -194,7 +195,7 @@ void main() {
         .write_pool(1, 0, &vertices)
         .unwrap();
     assert!(backend.ensure(2, 64, 64, false));
-    assert!(backend.clear_color(2, [0.0; 4], 0xf));
+    assert!(backend.clear_color(2, [0.0; 4], 0xf).is_ok());
     let state = DrawPipelineState::default();
     let pipeline = backend
         .graphics
@@ -440,6 +441,7 @@ fn module_and_pipeline_paths_reject_missing_features_before_driver_creation() {
             requires_demote_to_helper_invocation: demote,
             requires_maximal_reconvergence: maximal,
             surfaces: Vec::new(),
+            textures: Vec::new(),
         };
         let recipe = crate::startup_cache::PipelineRecipe {
             keys: vec![],
@@ -480,6 +482,7 @@ fn production_module_path_checks_demote_with_a_feature_mask() {
         requires_demote_to_helper_invocation: true,
         requires_maximal_reconvergence: false,
         surfaces: Vec::new(),
+        textures: Vec::new(),
     };
     // Mask the advertised feature on a real enabled device. Rejection must happen
     // in the production path before reaching the driver.

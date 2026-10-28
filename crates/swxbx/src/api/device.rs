@@ -1,4 +1,5 @@
 //! Device, device builder and the handles the device hands out.
+//! Signatures: docs/signatures/0001-setup.md, 0003-objects.md, 0005-device-answers.md.
 
 use super::{objects::Object, succeed, write_u32, Handler};
 use crate::instance::Status;
@@ -10,7 +11,7 @@ use crate::{
 
 static INTEGERS: &str = include_str!("../../../../data/device-integers.txt");
 
-/// The configured answer for a device integer selector.
+/// The observed answer for a device integer selector.
 pub fn device_integer(selector: u64) -> Option<u32> {
     INTEGERS
         .lines()
@@ -61,8 +62,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             succeed(registers)
         },
         "nvnDeviceGetInteger" => |instance, _, registers| {
-            // Answer only selectors named by the device contract.
-            // Anything else is left to the host.
+            // Only selectors the real implementation was seen answering can
+            // be answered. Anything else is left to the host.
             let Some(value) = device_integer(registers.x[1]) else {
                 return Status::Unimplemented;
             };
@@ -94,15 +95,15 @@ pub fn handler(name: &str) -> Option<Handler> {
             });
             Status::Ok
         },
-        // Registration succeeds because Vulkan does not require separate
-        // fast-clear value registration.
+        // Observed to return 1; what registering a fast-clear value changes
+        // on the platform is not something a Vulkan implementation needs.
         "nvnDeviceRegisterFastClearColor" | "nvnDeviceRegisterFastClearDepth" => {
             |_instance, _, registers| succeed(registers)
         }
         // A handle is whatever the program will hand back later. The pool
         // id it registered the object under is the simplest value that
-        // identifies it. The host contract leaves the value open, so this
-        // implementation uses the registered pool identifier.
+        // identifies it. Signatures 0003 marks the real handles as wide
+        // values; this choice is swxbx's own.
         "nvnDeviceGetSeparateTextureHandle"
         | "nvnDeviceGetSeparateSamplerHandle"
         | "nvnDeviceGetImageHandle" => |_instance, _, registers| {

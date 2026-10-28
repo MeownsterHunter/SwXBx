@@ -1,11 +1,11 @@
-//! Flat guest address allocation.
+//! Flat guest address allocation. Provenance: the documented contract
 
 #[cfg(any(test, feature = "vulkan"))]
 use std::collections::BTreeMap;
 
-/// Base of the flat guest GPU address range.
+/// Base of the flat guest GPU address range. Source: the public contract.
 pub const GUEST_BASE: u64 = 0x1_0000;
-/// Default flat arena size in bytes, equal to 1 GiB.
+/// Default flat arena size in bytes, equal to 1 GiB. Source: the public contract.
 pub const ARENA_SIZE: u64 = 1024 * 1024 * 1024;
 /// Byte offset of the global address delta in push constants.
 pub const PUSH_GLOBAL_DELTA_OFFSET: u32 = 0;
@@ -60,7 +60,7 @@ impl AddressMap {
     }
 }
 
-/// Allocated arena range and its backing program storage.
+/// Allocated arena range and its original program storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolAllocation {
     /// Byte offset from the arena base.

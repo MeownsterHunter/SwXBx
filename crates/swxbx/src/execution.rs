@@ -1,4 +1,4 @@
-//! Ordered guest submission ownership.
+//! Ordered guest submission ownership. Source: the public contract.
 use crate::{api::RecordedCommand, instance::InstanceState, Status};
 use std::sync::Arc;
 #[cfg(feature = "vulkan")]
@@ -23,38 +23,41 @@ pub(crate) struct QueueExecutor {
     #[cfg(feature = "vulkan")]
     runtime: OnceLock<Runtime>,
 }
-/// What waiting for every submitted batch found.
+/// What waiting for every submitted batch found. Source: the public contract., 0062.
 ///
-/// A batch's failure belongs to that batch, not to whichever call happens to
-/// wait next, so it is handed to the waiter as data and never becomes the
-/// waiter's own status.
+/// A batch that stopped early was reported when it ran; its failure never
+/// becomes the status of whichever call happens to wait next.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Drained {
-    /// Every batch submitted before the wait has run. Each batch that stopped
-    /// early is listed, in submission order, with the status it stopped on.
-    Ran(Vec<Status>),
+    /// Every batch submitted before the wait has run.
+    Ran,
     /// The device or the executor failed. No later batch runs and every later
     /// wait reports the same.
+    #[cfg(feature = "vulkan")]
     Lost,
+    /// The wait was called on the execution thread itself, which cannot wait
+    /// for the batches it is running.
+    #[cfg(feature = "vulkan")]
+    OnExecutionThread,
 }
 
-impl Drained {
-    /// The first status a waiter cares about: `InternalError` when lost, the
-    /// first failed batch's status, or `Ok`.
-    #[cfg(test)]
-    pub fn status(&self) -> Status {
-        match self {
-            Self::Lost => Status::InternalError,
-            Self::Ran(failures) => failures.first().copied().unwrap_or(Status::Ok),
-        }
-    }
+/// How far the batches before a waiting call must have gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// Run, so their device work is on the queue ahead of anything the call
+    /// submits; queue order and the call's own barriers order the device.
+    /// Presentation needs no more.
+    Queued,
+    /// Run and finished on the device, for calls whose results the host may
+    /// read.
+    Completed,
 }
 
 /// The execution thread's state between waits.
 #[cfg(feature = "vulkan")]
 enum Worker {
-    /// Batches run. The failures since the last wait are kept for it.
-    Running(Vec<Status>),
+    /// Batches run.
+    Running,
     /// A batch or the device failed internally. Later batches are consumed
     /// without running.
     Lost,
@@ -63,13 +66,15 @@ enum Worker {
 #[cfg(feature = "vulkan")]
 enum Message {
     Submit(u64, Vec<(u64, Vec<RecordedCommand>)>),
-    Drain(mpsc::SyncSender<Drained>),
+    Drain(mpsc::SyncSender<Drained>, Reach),
 }
 #[cfg(feature = "vulkan")]
 struct Runtime {
     sender: Mutex<Option<mpsc::Sender<Message>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     submitted: AtomicU64,
+    /// The last ticket that has run, so a `Reach::Queued` wait can skip the worker.
+    ran: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
 }
 impl QueueExecutor {
@@ -102,26 +107,31 @@ impl QueueExecutor {
         }
         crate::api::queue::execute(&self.state, buffers)
     }
-    /// Wait until every batch submitted so far has run.
-    pub fn drain(&self) -> Drained {
+    /// Wait until every batch submitted so far has run, and with
+    /// `Reach::Completed` until its device work has finished.
+    pub fn drain(&self, reach: Reach) -> Drained {
+        #[cfg(not(feature = "vulkan"))]
+        let _ = reach;
         #[cfg(feature = "vulkan")]
         if EXECUTION_OWNER.with(|owner| owner.get() == Arc::as_ptr(&self.state) as usize) {
-            return Drained::Lost;
+            return Drained::OnExecutionThread;
         }
         #[cfg(feature = "vulkan")]
         if let Some(runtime) = self.runtime.get() {
-            if runtime.completed.load(Ordering::Acquire)
-                == runtime.submitted.load(Ordering::Acquire)
-            {
-                return Drained::Ran(Vec::new());
+            let reached = match reach {
+                Reach::Queued => &runtime.ran,
+                Reach::Completed => &runtime.completed,
+            };
+            if reached.load(Ordering::Acquire) == runtime.submitted.load(Ordering::Acquire) {
+                return Drained::Ran;
             }
             let (sender, receiver) = mpsc::sync_channel(1);
-            if !runtime.send(Message::Drain(sender)) {
+            if !runtime.send(Message::Drain(sender, reach)) {
                 return Drained::Lost;
             }
             return receiver.recv().unwrap_or(Drained::Lost);
         }
-        Drained::Ran(Vec::new())
+        Drained::Ran
     }
     pub fn shutdown(&mut self) {
         #[cfg(feature = "vulkan")]
@@ -136,17 +146,19 @@ impl Runtime {
         let (sender, receiver) = mpsc::channel();
         let completed = Arc::new(AtomicU64::new(0));
         let worker_completed = completed.clone();
+        let ran = Arc::new(AtomicU64::new(0));
+        let worker_ran = ran.clone();
         let worker = thread::Builder::new()
             .name("execution-owner".into())
             .spawn(move || {
                 EXECUTION_OWNER.with(|owner| owner.set(Arc::as_ptr(&state) as usize));
-                let mut worker = Worker::Running(Vec::new());
+                let mut worker = Worker::Running;
                 let mut consumed = 0;
                 for message in receiver {
                     match message {
                         Message::Submit(ticket, buffers) => {
                             consumed = ticket;
-                            let Worker::Running(failures) = &mut worker else {
+                            let Worker::Running = worker else {
                                 continue;
                             };
                             let result =
@@ -154,26 +166,32 @@ impl Runtime {
                                     crate::api::queue::execute(&state, buffers)
                                 }))
                                 .unwrap_or(Status::InternalError);
-                            match result {
-                                Status::Ok => {}
-                                Status::InternalError => worker = Worker::Lost,
-                                failed => failures.push(failed),
+                            if result == Status::InternalError {
+                                worker = Worker::Lost;
+                            } else {
+                                worker_ran.store(ticket, Ordering::Release);
                             }
                         }
-                        Message::Drain(reply) => {
-                            if state
-                                .gpu
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .as_ref()
-                                .is_some_and(|backend| !backend.finish())
+                        Message::Drain(reply, reach) => {
+                            if reach == Reach::Completed
+                                && state
+                                    .gpu
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .as_ref()
+                                    .is_some_and(|backend| !backend.finish())
                             {
                                 worker = Worker::Lost;
                             }
-                            let drained = match &mut worker {
-                                Worker::Running(failures) => {
-                                    worker_completed.store(consumed, Ordering::Release);
-                                    Drained::Ran(std::mem::take(failures))
+                            let drained = match worker {
+                                Worker::Running => {
+                                    // `completed` lets a later drain skip the
+                                    // worker, so it only records batches the
+                                    // device has finished.
+                                    if reach == Reach::Completed {
+                                        worker_completed.store(consumed, Ordering::Release);
+                                    }
+                                    Drained::Ran
                                 }
                                 Worker::Lost => Drained::Lost,
                             };
@@ -191,6 +209,7 @@ impl Runtime {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
             submitted: AtomicU64::new(0),
+            ran,
             completed,
         }
     }
@@ -246,16 +265,16 @@ mod tests {
             )]),
             Status::Ok
         );
-        assert_eq!(queue.drain(), Drained::Ran(vec![Status::Unimplemented]));
-        assert_eq!(queue.drain(), Drained::Ran(Vec::new()));
+        assert_eq!(queue.drain(Reach::Completed), Drained::Ran);
+        assert_eq!(queue.drain(Reach::Completed), Drained::Ran);
         let runtime = queue.runtime.get().unwrap();
         assert_eq!(
             runtime.completed.load(Ordering::Acquire),
             runtime.submitted.load(Ordering::Acquire)
         );
-        assert_eq!(queue.drain(), Drained::Ran(Vec::new()));
+        assert_eq!(queue.drain(Reach::Completed), Drained::Ran);
         assert_eq!(queue.submit(Vec::new()), Status::Ok);
-        assert_eq!(queue.drain(), Drained::Ran(Vec::new()));
+        assert_eq!(queue.drain(Reach::Completed), Drained::Ran);
         queue.shutdown();
     }
 
@@ -282,6 +301,6 @@ mod tests {
             drop(driver);
             assert_eq!(result.unwrap(), Status::Ok);
         });
-        assert_eq!(instance.queue.drain(), Drained::Ran(Vec::new()));
+        assert_eq!(instance.queue.drain(Reach::Completed), Drained::Ran);
     }
 }

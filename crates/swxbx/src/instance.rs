@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// Host shader-stage identifier; registration uses the unknown stage until established.
 pub type ShaderStage = u32;
-/// Stage token used when shader records do not establish a stage.
+/// Stage token used when observed shader records do not establish a stage.
 pub const SHADER_STAGE_UNKNOWN: ShaderStage = 0;
 
 #[derive(Clone, Copy)]
@@ -39,7 +39,7 @@ pub trait ShaderTranslator: Send + Sync {
     fn translate(&self, stage: ShaderStage, code: &[u8]) -> Result<Vec<u32>, String>;
 
     /// Return the exact runtime identity from the translator's public cache API.
-    /// None means required translation state is absent.
+    /// None means required translation state is absent. Source: the public contract.
     fn translation_cache_key(
         &self,
         _stage: ShaderStage,
@@ -51,7 +51,7 @@ pub trait ShaderTranslator: Send + Sync {
 
     /// Encode an opaque disk record for the supplied translation context.
     /// None disables persistence. Errors are diagnostics and preserve translation.
-    /// Records must retain every execution requirement.
+    /// Records must retain every execution requirement. Evidence: the public contract.
     fn encode_cache_record(
         &self,
         _shader: &crate::startup_cache::TranslatedShader,
@@ -63,12 +63,27 @@ pub trait ShaderTranslator: Send + Sync {
     /// Validate an opaque record against the key and translator identity.
     /// None means disabled, stale, or incompatible. Malformed records return
     /// a diagnostic. Results restore all requirements and the supplied key.
+    /// Evidence: the public contract.
     fn decode_cache_record(
         &self,
         _key: &str,
         _bytes: &[u8],
     ) -> Result<Option<crate::startup_cache::TranslatedShader>, String> {
         Ok(None)
+    }
+
+    /// What translating `code` needs beyond the code and the instance's
+    /// context. Code that needs the draw's input primitive (a geometry
+    /// stage) is translated at each draw, with
+    /// [`TranslationContext::geometry_input`](crate::startup_cache::TranslationContext::geometry_input)
+    /// stating that draw's primitive; other code translates when it is
+    /// registered.
+    fn translation_needs(
+        &self,
+        _stage: ShaderStage,
+        _code: &[u8],
+    ) -> crate::startup_cache::TranslationNeeds {
+        crate::startup_cache::TranslationNeeds::Code
     }
 
     /// Adapters with state or subgroup requirements must override this method.
@@ -88,6 +103,7 @@ pub trait ShaderTranslator: Send + Sync {
             requires_demote_to_helper_invocation: false,
             requires_maximal_reconvergence: false,
             surfaces: Vec::new(),
+            textures: Vec::new(),
         })
     }
 }
@@ -130,14 +146,15 @@ pub struct Host {
     >,
     /// The output scale. Values below 1 are treated as 1.0.
     pub render_scale: f32,
-    /// Called immediately before a texture is presented.
+    /// Waits for one vertical blank. RGBA callback presentation calls it once
+    /// per blank of the window's present interval before each delivery.
     pub wait_vblank: Option<unsafe extern "C" fn(user: *mut c_void)>,
-    /// Optional version-5 Vulkan presentation contract. See docs/host-interface.md.
+    /// Optional Vulkan presentation contract (version 6). See docs/host-interface.md.
     pub vulkan: *const HostVulkan,
 }
 
 /// Host-owned platform integration. Vulkan handles cross this C boundary as u64.
-///
+/// Source: the public contract.-presentation.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostVulkan {
@@ -160,6 +177,28 @@ pub struct HostVulkan {
         width: *mut u32,
         height: *mut u32,
     ),
+    /// Write how the presented image fills the drawable, at every present.
+    /// There is no default: the library hands in `HostScaling::UNSTATED`, and
+    /// a present whose scaling is unstated or invalid is refused by name.
+    /// Source: the public contract.
+    pub scaling: unsafe extern "C" fn(
+        user: *mut c_void,
+        window_object: u64,
+        scaling: *mut crate::presentation::HostScaling,
+    ),
+}
+
+impl Host {
+    /// Ask the native host how window `window`'s presented image fills its
+    /// drawable. Only for a host whose `vulkan` is non-null.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn scaling(&self, window: u64) -> Result<crate::presentation::Scaling, String> {
+        let mut stated = crate::presentation::HostScaling::UNSTATED;
+        // SAFETY: `vulkan` is non-null and, with its callbacks and `user`,
+        // valid for the instance's life (the `with_host` contract).
+        unsafe { ((*self.vulkan).scaling)(self.user, window, &mut stated) };
+        stated.parse()
+    }
 }
 
 // SAFETY: a `Host` only reaches an instance through `Instance::with_host`,
@@ -216,7 +255,10 @@ pub struct InstanceState {
     pub(crate) presentation: Mutex<crate::presentation::Presentation>,
     /// Whether a batch stops or skips at a command swxbx cannot run.
     pub(crate) unsupported_commands: crate::unsupported::UnsupportedCommands,
-    /// Which guest counter token selects which counter.
+    /// The first batch since the last present that stopped before its end:
+    /// the command and the reason. The next present refuses while it holds.
+    stopped_batch: Mutex<Option<String>>,
+    /// Which guest counter token selects which counter. Source: the public contract.
     counters: Mutex<crate::counters::CounterContract>,
     /// swxbx's record of the program's objects.
     pub objects: Objects,
@@ -229,6 +271,10 @@ pub struct InstanceState {
     /// Names the program asked for that are not in the table, with how often.
     unknown_requests: Mutex<BTreeMap<String, u64>>,
     shader_translator: Mutex<Option<Arc<dyn ShaderTranslator>>>,
+    /// The translation hook each program registered under, by program
+    /// handle. Its later translations (a geometry stage per primitive, a
+    /// stage per texel image) use it, whatever hook is installed by then.
+    program_translators: Mutex<HashMap<u64, Arc<dyn ShaderTranslator>>>,
     pub(crate) startup_cache: Mutex<Option<crate::startup_cache::StartupCache>>,
     shader_translation_enabled: AtomicBool,
     shader_dump_directory: Mutex<Option<PathBuf>>,
@@ -237,6 +283,9 @@ pub struct InstanceState {
     successful_shader_translations: AtomicU64,
     distinct_shader_outputs: Mutex<BTreeSet<u64>>,
     shader_translation_errors: Mutex<BTreeMap<String, u64>>,
+    /// Stage translations specialized by the textures draws bind.
+    #[cfg(feature = "vulkan")]
+    pub(crate) specializations: Mutex<crate::api::specialization::Specializations>,
     pending_shaders: Mutex<HashMap<u64, Vec<PendingShader>>>,
     shader_late_reads: Mutex<BTreeMap<&'static str, u64>>,
     shader_zero_header: AtomicU64,
@@ -247,9 +296,30 @@ pub struct InstanceState {
     host_writes: Mutex<crate::dirty_ranges::Ranges>,
     #[cfg(feature = "vulkan")]
     recording_strides: arc_swap::ArcSwap<[Option<u64>; 2]>,
+    /// The backend's copy decoder and image rules, for the recording call.
+    #[cfg(feature = "vulkan")]
+    pub(crate) copy_rules: arc_swap::ArcSwap<crate::api::CopyRules>,
 }
 
 impl InstanceState {
+    /// Remember where a batch stopped, unless an earlier batch since the
+    /// last present already did.
+    pub(crate) fn batch_stopped(&self, at: String) {
+        self.stopped_batch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert(at);
+    }
+
+    /// Where the first batch since the last present stopped, if one did;
+    /// the next frame starts with none.
+    pub(crate) fn take_stopped_batch(&self) -> Option<String> {
+        self.stopped_batch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
     /// An instance with no host. It can record requests and calls, which is
     /// all the library does so far.
     pub fn new() -> Self {
@@ -274,6 +344,7 @@ impl InstanceState {
             host,
             presentation: Mutex::default(),
             unsupported_commands: crate::unsupported::UnsupportedCommands::from_env(),
+            stopped_batch: Mutex::default(),
             counters: Mutex::default(),
             objects: Objects::new(),
             handlers: functions::all()
@@ -284,6 +355,7 @@ impl InstanceState {
             shapes: (0..count).map(|_| Mutex::default()).collect(),
             unknown_requests: Mutex::new(BTreeMap::new()),
             shader_translator: Mutex::new(None),
+            program_translators: Mutex::new(HashMap::new()),
             startup_cache: Mutex::new(None),
             shader_translation_enabled: AtomicBool::new(false),
             shader_dump_directory: Mutex::new(None),
@@ -292,6 +364,8 @@ impl InstanceState {
             successful_shader_translations: AtomicU64::new(0),
             distinct_shader_outputs: Mutex::new(BTreeSet::new()),
             shader_translation_errors: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "vulkan")]
+            specializations: Mutex::default(),
             pending_shaders: Mutex::new(HashMap::new()),
             shader_late_reads: Mutex::new(BTreeMap::new()),
             shader_zero_header: AtomicU64::new(0),
@@ -302,6 +376,8 @@ impl InstanceState {
             host_writes: Mutex::default(),
             #[cfg(feature = "vulkan")]
             recording_strides: arc_swap::ArcSwap::from_pointee([None, None]),
+            #[cfg(feature = "vulkan")]
+            copy_rules: arc_swap::ArcSwap::default(),
         }
     }
 
@@ -372,7 +448,7 @@ impl InstanceState {
     }
 
     /// Select inputs for subsequent registrations. Existing requests keep their
-    /// retained context; register a program again to translate a different variant.
+    /// original context; register a program again to translate a different variant.
     pub fn set_shader_translation_context(
         &self,
         context: crate::startup_cache::TranslationContext,
@@ -383,6 +459,18 @@ impl InstanceState {
         };
         cache.set_context(context);
         true
+    }
+
+    /// The context registrations currently translate in; the default when no
+    /// startup cache is configured.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn translation_context(&self) -> crate::startup_cache::TranslationContext {
+        self.startup_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cache| cache.context())
+            .unwrap_or_default()
     }
 
     /// Return startup cache counters, or None if no startup cache is configured.
@@ -458,7 +546,7 @@ impl InstanceState {
 
     /// Select which guest counter token selects which counter. Every
     /// instance starts with `CounterContract::default()`. Recordings made
-    /// after this call use the new contract.
+    /// after this call use the new contract. Source: the public contract.
     pub fn set_counter_contract(&self, contract: crate::counters::CounterContract) {
         *self.counters.lock().unwrap_or_else(|p| p.into_inner()) = contract;
     }
@@ -471,7 +559,7 @@ impl InstanceState {
             .counter(token)
     }
 
-    /// Select explicit command hypotheses. See
+    /// Select explicit command hypotheses. See the public contract.
     #[cfg(feature = "vulkan")]
     pub fn set_command_contract(
         &self,
@@ -492,16 +580,43 @@ impl InstanceState {
     }
 
     /// Enable the bounded first draw experiment with explicit host enum choices.
-    /// Returns false when this instance has no Vulkan backend.
+    /// Returns false when this instance has no Vulkan backend, or when a
+    /// color or depth format table entry is one swxbx cannot draw with; the
+    /// entry is named through `swxbx_last_error`. Source: the public contract.
     #[cfg(feature = "vulkan")]
     pub fn set_first_draw_contract(
         &self,
         contract: Option<crate::gpu::graphics::FirstDrawContract>,
     ) -> bool {
+        if let Some(Err(why)) = contract.as_ref().map(|c| c.validate()) {
+            crate::unsupported::refuse(
+                crate::Status::BadArgument,
+                format!("first-draw contract: {why}"),
+            );
+            return false;
+        }
         let mut gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
         let Some(backend) = gpu.as_mut() else {
             return false;
         };
+        let mut depth_images = Vec::new();
+        for &(token, format) in contract
+            .iter()
+            .filter_map(|c| c.depth_raster.as_ref())
+            .flat_map(|d| &d.depth_formats)
+        {
+            match crate::gpu::formats::DepthImage::resolve(backend.context(), format) {
+                Ok(image) => depth_images.push((token, image)),
+                Err(why) => {
+                    crate::unsupported::refuse(
+                        crate::Status::BadArgument,
+                        format!("first-draw contract: depth target format token {token}: {why}"),
+                    );
+                    return false;
+                }
+            }
+        }
+        backend.depth_images = depth_images;
         let strides = contract.as_ref().map_or([None, None], |contract| {
             [
                 contract.attribute_state_stride,
@@ -520,7 +635,7 @@ impl InstanceState {
     }
 
     /// Configure explicit stage/index-to-bank choices for translated graphics.
-    /// Invalid mappings leave the current contract unchanged.
+    /// Invalid mappings leave the current contract unchanged. Source: the public contract.
     #[cfg(feature = "vulkan")]
     pub fn set_uniform_buffer_contract(
         &self,
@@ -533,7 +648,7 @@ impl InstanceState {
         Ok(())
     }
 
-    /// Configure explicit texture slot and sampler enum choices.
+    /// Configure explicit texture slot and sampler enum choices. Source: the public contract.
     #[cfg(feature = "vulkan")]
     pub fn set_texture_contract(
         &self,
@@ -557,7 +672,11 @@ impl InstanceState {
         let Some(backend) = gpu.as_mut() else {
             return false;
         };
-        backend.copy_decoder = decoder;
+        backend.copy_decoder = decoder.clone();
+        self.copy_rules.rcu(|rules| crate::api::CopyRules {
+            decoder: decoder.clone(),
+            images: rules.images.clone(),
+        });
         true
     }
 
@@ -570,13 +689,17 @@ impl InstanceState {
         contract.validate()?;
         let mut gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
         let backend = gpu.as_mut().ok_or("Vulkan backend is unavailable")?;
-        if !backend.set_image_contract(contract) {
+        if !backend.set_image_contract(contract.clone()) {
             return Err("image rules cannot change while arena images are live".into());
         }
+        self.copy_rules.rcu(|rules| crate::api::CopyRules {
+            decoder: rules.decoder.clone(),
+            images: contract.clone(),
+        });
         Ok(())
     }
 
-    /// Opt into blend and channel argument hypotheses.
+    /// Opt into blend and channel argument hypotheses. Source: the public contract.
     #[cfg(feature = "vulkan")]
     pub fn set_blend_contract(
         &self,
@@ -736,6 +859,27 @@ impl InstanceState {
             .clone()
     }
 
+    /// Remember the hook `program`'s shaders register under.
+    pub(crate) fn set_program_translator(
+        &self,
+        program: u64,
+        translator: Arc<dyn ShaderTranslator>,
+    ) {
+        self.program_translators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(program, translator);
+    }
+
+    /// The hook `program`'s shaders registered under.
+    pub(crate) fn program_translator(&self, program: u64) -> Option<Arc<dyn ShaderTranslator>> {
+        self.program_translators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&program)
+            .cloned()
+    }
+
     /// Enable or disable translation during future shader registration.
     pub fn set_shader_translation_enabled(&self, enabled: bool) {
         self.shader_translation_enabled
@@ -743,7 +887,8 @@ impl InstanceState {
     }
 
     /// Set the directory for optional translated shader dumps. `None` disables
-    /// dumping. The directory receives translated output, never input shader bytes.
+    /// dumping. The directory receives output derived from the observed
+    /// program's shaders, never the original shader bytes.
     pub fn set_shader_dump_directory(&self, directory: Option<&Path>) {
         *self
             .shader_dump_directory
@@ -932,37 +1077,63 @@ impl InstanceState {
         std::mem::take(&mut *self.host_writes.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// Adopt coherent arena storage for a registered pool, preserving its contents.
+    /// Adopt coherent arena storage for a registered pool, preserving its
+    /// contents, once queued batches have run. Batches still queued are not
+    /// seen: `Instance::map_pool` runs them first and is the only way to reach
+    /// this. A refusal is named through `swxbx_last_error`.
     ///
     /// # Safety
     /// Follow `GlobalMemory::map_pool` for pointer lifetime, callback routing and
-    /// access synchronization. Serialize mapped accesses with submissions.
+    /// access synchronization.
     #[cfg(feature = "vulkan")]
-    pub unsafe fn map_pool(&self, pool: u64) -> Option<*mut u8> {
+    pub(crate) unsafe fn map_pool_after_queued(&self, pool: u64) -> Result<*mut u8, Status> {
         let mut gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
-        let memory = gpu.as_mut()?.global_memory.as_mut()?;
+        let Some(memory) = gpu.as_mut().and_then(|b| b.global_memory.as_mut()) else {
+            return Err(no_device_memory("map", pool));
+        };
         for range in self.take_host_writes().intersections(0..u64::MAX) {
             memory.notify_storage_write(range.start, range.end - range.start);
         }
         if !memory.upload(|address, out| self.read_memory(address, out)) {
-            return None;
+            return Err(crate::unsupported::refuse(
+                Status::InternalError,
+                format!(
+                    "map pool {pool:#x}: reading guest memory into device storage before mapping failed"
+                ),
+            ));
         }
-        unsafe { memory.map_pool(pool) }
+        unsafe { memory.map_pool(pool) }.map_err(|fault| pool_fault("map", pool, fault))
     }
 
-    /// Wait for overlapping device access before using mapped storage.
+    /// Wait for overlapping device access to mapped storage from batches that
+    /// have already run. Batches still queued are not seen: `Instance::wait_pool`
+    /// runs them first and is the only way to reach this. A refusal is named
+    /// through `swxbx_last_error`.
     #[cfg(feature = "vulkan")]
-    pub fn wait_pool(&self, pool: u64, offset: u64, size: usize, write: bool) -> bool {
-        self.gpu
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .and_then(|b| b.global_memory.as_ref())
-            .and_then(|m| m.wait_pool(pool, offset, size, write))
-            .is_some()
+    pub(crate) fn wait_pool_after_queued(
+        &self,
+        pool: u64,
+        offset: u64,
+        size: usize,
+        write: bool,
+    ) -> Status {
+        let gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(memory) = gpu.as_ref().and_then(|b| b.global_memory.as_ref()) else {
+            return no_device_memory("wait on", pool);
+        };
+        match memory.wait_pool(pool, offset, size, write) {
+            Ok(()) => Status::Ok,
+            Err(crate::gpu::PoolFault::UnknownRange) => crate::unsupported::refuse(
+                Status::BadArgument,
+                format!(
+                    "wait on pool {pool:#x}: {size} bytes at offset {offset:#x} do not lie inside a registered pool"
+                ),
+            ),
+            Err(fault) => pool_fault("wait on", pool, fault),
+        }
     }
 
-    /// Cumulative payload copies and inspection bytes for this instance.
+    /// Cumulative payload copies and legacy inspection bytes for this instance.
     #[cfg(feature = "vulkan")]
     pub fn transfer_statistics(&self) -> Option<crate::gpu::TransferStatistics> {
         self.gpu
@@ -995,7 +1166,8 @@ impl InstanceState {
         unsafe { write(user, address, data.as_ptr(), data.len() as u64) == 0 }
     }
 
-    /// Report a completed host call so diagnostics can sample results with arguments.
+    /// A host that lets the original implementation run reports what it
+    /// returned here, so results are sampled along with arguments.
     pub fn returned(&self, function: FunctionId, registers: &Registers) -> Status {
         if function.0 as usize >= self.shapes.len() {
             return Status::BadFunction;
@@ -1118,6 +1290,30 @@ impl InstanceState {
     }
 }
 
+/// Refuse a pool access on an instance that has no device memory.
+#[cfg(feature = "vulkan")]
+fn no_device_memory(access: &str, pool: u64) -> Status {
+    crate::unsupported::refuse(
+        Status::BadArgument,
+        format!("{access} pool {pool:#x}: no device memory exists, so no pool is registered"),
+    )
+}
+
+/// Refuse a pool access by what the device memory found.
+#[cfg(feature = "vulkan")]
+fn pool_fault(access: &str, pool: u64, fault: crate::gpu::PoolFault) -> Status {
+    match fault {
+        crate::gpu::PoolFault::UnknownRange => crate::unsupported::refuse(
+            Status::BadArgument,
+            format!("{access} pool {pool:#x}: the pool is not registered"),
+        ),
+        crate::gpu::PoolFault::WaitFailed => crate::unsupported::refuse(
+            Status::InternalError,
+            format!("{access} pool {pool:#x}: waiting for device access to it failed"),
+        ),
+    }
+}
+
 /// Host connection whose shutdown joins all queued execution.
 pub struct Instance {
     state: Arc<InstanceState>,
@@ -1137,12 +1333,82 @@ impl Instance {
         Self::from_state(InstanceState::new())
     }
 
+    /// Record a typed texel-buffer binding supplied by a host adapter.
+    #[cfg(feature = "vulkan")]
+    pub fn record_texel_buffer(
+        &self,
+        command_buffer: u64,
+        stage: u64,
+        index: u64,
+        address: u64,
+        size: u64,
+        format: ash::vk::Format,
+    ) -> Status {
+        let command =
+            crate::api::RecordedCommand::State(crate::api::StateCommand::BindTexelBuffer {
+                stage,
+                index,
+                address,
+                size,
+                format: format.as_raw() as u32,
+            });
+        self.objects
+            .record_host_command(command_buffer, command)
+            .map_or_else(|status| status, |_| Status::Ok)
+    }
+
     /// Create a hosted instance.
     ///
     /// # Safety
     /// Callbacks and their context remain valid until shutdown returns and support concurrent calls.
     pub unsafe fn with_host(host: Host) -> Self {
         Self::from_state(unsafe { InstanceState::with_host(host) })
+    }
+
+    /// Wait for overlapping device access before using mapped storage. Batches
+    /// submitted on this instance before the call count: they run first, so
+    /// their access is known. A refusal is named through `swxbx_last_error`.
+    /// Source: the public contract.
+    #[cfg(feature = "vulkan")]
+    pub fn wait_pool(&self, pool: u64, offset: u64, size: usize, write: bool) -> Status {
+        match self.run_queued("wait on", pool) {
+            Ok(()) => self.state.wait_pool_after_queued(pool, offset, size, write),
+            Err(status) => status,
+        }
+    }
+
+    /// Adopt coherent arena storage for a registered pool, preserving its
+    /// contents. Batches submitted on this instance before the call run first,
+    /// so none of them runs after the pool's backing changed. A refusal is
+    /// named through `swxbx_last_error`. Source: the public contract.
+    ///
+    /// # Safety
+    /// Follow `GlobalMemory::map_pool` for pointer lifetime, callback routing and
+    /// access synchronization.
+    #[cfg(feature = "vulkan")]
+    pub unsafe fn map_pool(&self, pool: u64) -> Result<*mut u8, Status> {
+        self.run_queued("map", pool)?;
+        unsafe { self.state.map_pool_after_queued(pool) }
+    }
+
+    /// Run every batch submitted before a host access to `pool`.
+    #[cfg(feature = "vulkan")]
+    fn run_queued(&self, access: &str, pool: u64) -> Result<(), Status> {
+        match self.queue.drain(crate::execution::Reach::Queued) {
+            crate::execution::Drained::Ran => Ok(()),
+            crate::execution::Drained::Lost => Err(crate::unsupported::refuse(
+                Status::InternalError,
+                format!(
+                    "{access} pool {pool:#x}: the device was lost, so earlier batches never ran"
+                ),
+            )),
+            crate::execution::Drained::OnExecutionThread => Err(crate::unsupported::refuse(
+                Status::BadArgument,
+                format!(
+                    "{access} pool {pool:#x}: called on SwXBx's execution thread, which cannot wait for the batches it runs"
+                ),
+            )),
+        }
     }
 
     fn from_state(state: InstanceState) -> Self {
@@ -1181,7 +1447,7 @@ impl Instance {
         config: crate::startup_cache::StartupCacheConfig,
         translator: Arc<dyn ShaderTranslator>,
     ) -> Result<(), String> {
-        if self.queue.drain() == crate::execution::Drained::Lost {
+        if self.queue.drain(crate::execution::Reach::Completed) != crate::execution::Drained::Ran {
             return Err("queued execution failed".into());
         }
         self.state.configure_startup_cache(config, translator)
@@ -1191,6 +1457,9 @@ impl Instance {
     /// function is counted and reported as unimplemented with zeroed
     /// results.
     pub fn call(&self, function: FunctionId, registers: &mut Registers) -> Status {
+        // A recording call refuses misuse on this thread; its reason in
+        // `swxbx_last_error` belongs to this call. Source: the public contract.
+        crate::clear_last_error();
         let name = functions::name(function);
         if name.is_some_and(|name| {
             !name.contains("CommandBuffer")
@@ -1199,8 +1468,15 @@ impl Instance {
         }) {
             // Waiting orders this call after earlier batches. A batch that
             // stopped early was reported when it ran; only a lost device
-            // fails this call.
-            if self.queue.drain() == crate::execution::Drained::Lost {
+            // fails this call. Source: the public contract. Presenting copies the
+            // texture on the device queue behind those batches, so it waits
+            // for them to run, not for the device to finish them.
+            let reach = if name.is_some_and(|name| name.ends_with("QueuePresentTexture")) {
+                crate::execution::Reach::Queued
+            } else {
+                crate::execution::Reach::Completed
+            };
+            if self.queue.drain(reach) != crate::execution::Drained::Ran {
                 return Status::InternalError;
             }
         }

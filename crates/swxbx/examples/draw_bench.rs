@@ -1,4 +1,4 @@
-//! Measure a scene of small textured draws.
+//! Measure an original scene of small textured draws. Source: the public contract.
 mod support;
 
 use ash::vk;
@@ -13,7 +13,7 @@ use swxbx::{
     gpu::{
         graphics::{FirstDrawContract, PrimitiveTopology, VertexFormat},
         textures::{TextureContract, TextureMapping},
-        uniforms::UniformStage,
+        uniforms::GraphicsStage,
     },
 };
 
@@ -61,7 +61,7 @@ fn scene(frames: usize, draws_per_frame: usize, indexed: bool, fail_tail: bool) 
             index_u16: 6,
             index_u32: 7,
             cull_none: 3,
-            rgba8: 4,
+            color_formats: vec![(4, ash::vk::Format::R8G8B8A8_UNORM)],
             target_2d: 5,
             identity_swizzle: [0; 4],
             depth_raster: None,
@@ -73,7 +73,7 @@ fn scene(frames: usize, draws_per_frame: usize, indexed: bool, fail_tail: bool) 
             bindings: vec![TextureMapping {
                 stage: 5,
                 index: 3,
-                target: UniformStage::Fragment,
+                target: GraphicsStage::Fragment,
                 set: 1,
                 image: 0,
                 sampler: 1,
@@ -89,7 +89,7 @@ fn scene(frames: usize, draws_per_frame: usize, indexed: bool, fail_tail: bool) 
             bindings: vec![swxbx::gpu::uniforms::UniformBankMapping {
                 stage: 5,
                 index: 0,
-                target: UniformStage::Fragment,
+                target: GraphicsStage::Fragment,
                 bank: 0,
             }],
             storage_buffers: false,

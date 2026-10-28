@@ -1,4 +1,4 @@
-//! Headless swapchain pacing and retirement checks.
+//! Original headless swapchain pacing and retirement check. Source: the public contract.
 #![cfg(feature = "vulkan")]
 
 use ash::{vk, vk::Handle};
@@ -9,7 +9,10 @@ use std::{
         Mutex,
     },
 };
-use swxbx::{Host, HostVulkan, Instance, PresentationConfig, PresentationMode, Registers, Status};
+use swxbx::{
+    Host, HostScaling, HostVulkan, Instance, PresentationConfig, PresentationMode, Registers,
+    Status, SCALING_FIT,
+};
 
 struct State {
     memory: Mutex<Vec<u8>>,
@@ -52,6 +55,16 @@ unsafe extern "C" fn size(user: *mut c_void, _: u64, width: *mut u32, height: *m
         *height = extent;
     }
 }
+/// A 16:9 fit on the square headless drawable: bars above and below.
+unsafe extern "C" fn fit(_: *mut c_void, _: u64, scaling: *mut HostScaling) {
+    unsafe {
+        *scaling = HostScaling {
+            kind: SCALING_FIT,
+            aspect_width: 16.0,
+            aspect_height: 9.0,
+        };
+    }
+}
 fn call(instance: &Instance, suffix: &str, args: &[u64]) -> u64 {
     let id = swxbx::functions::all()
         .find(|(_, n)| n.get(3..) == Some(suffix))
@@ -79,6 +92,7 @@ fn native_modes_resize_capacity_and_teardown() {
         extensions: extensions.as_ptr(),
         create_surface: surface,
         drawable_size: size,
+        scaling: fit,
     };
     let instance = unsafe {
         Instance::with_host(Host {

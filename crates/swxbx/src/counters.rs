@@ -1,9 +1,13 @@
 //! Counter reports: which counter a guest token selects, and the report the
-//! graphics processor writes for it.
+//! graphics processor writes for it. Source: the public contract.
 //!
 //! A report is sixteen bytes at the given GPU address: the counter value as a
 //! little-endian 64-bit word, then the GPU timer as a little-endian 64-bit
-//! word. The layout uses a fixed hardware counter frequency.
+//! word. The layout and the timer frequency follow the Maxwell semaphore
+//! counter report in the reference host (MIT), `the reference host.Graphics.Gpu/Engine/Threed/
+//! SemaphoreUpdater.cs` (`CounterData`, `ReportCounter`) and
+//! `the reference host.Graphics.Gpu/GpuContext.cs` (`ConvertNanosecondsToTicks`).
+//! Copyright (c) the reference host Team and Contributors, MIT licensed.
 
 use std::collections::BTreeMap;
 #[cfg(feature = "vulkan")]
@@ -26,7 +30,7 @@ pub enum Counter {
 
 /// Which guest counter token selects which counter. The tokens are not
 /// recovered interface facts; each is a host hypothesis or an observation
-/// recorded in
+/// recorded in the public contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CounterContract {
     tokens: BTreeMap<u64, Counter>,
@@ -48,7 +52,9 @@ impl CounterContract {
 }
 
 impl Default for CounterContract {
-    /// The contract every instance starts with. Token 0 selects the timestamp.
+    /// The contract every instance starts with. The only token observed in
+    /// a program's reports is 0, and that program advanced once its reports
+    /// carried a rising timer (the public contract), so 0 selects the timestamp.
     fn default() -> Self {
         Self::new([(0, Counter::Timestamp)])
     }
@@ -77,7 +83,7 @@ impl GpuClock {
 
 /// Timer ticks in a span of nanoseconds, at 384 ticks per 625 ns. Dividing
 /// first keeps the product in range; the remainder is converted apart.
-/// Convert nanoseconds to hardware timer ticks without overflowing.
+/// Ported from the reference host `GpuContext.ConvertNanosecondsToTicks` (MIT).
 #[cfg(feature = "vulkan")]
 fn ticks(nanoseconds: u64) -> u64 {
     let divided = nanoseconds / 625;

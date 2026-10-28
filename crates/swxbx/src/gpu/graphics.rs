@@ -1,9 +1,9 @@
-//! Bounded drawing with public Vulkan state and host choices.
+//! Bounded drawing with public Vulkan state and host choices. Source: the public contract., 0028, 0029, 0037, 0038.
 use super::{
     graphics_libraries::{Compiler, Part},
     graphics_modules::{ShaderModule, ShaderModules},
     pipelines::{CacheStats, DriverCache, PersistenceStats, TranslationIdentity},
-    uniforms::{self, Bank, UniformStage, BANK_SIZE},
+    uniforms::{self, Bank, GraphicsStage, BANK_SIZE},
     Context, GlobalMemory,
 };
 use ash::vk;
@@ -14,10 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Opt-in host interpretation, not established guest enums.
+/// Opt-in host interpretation, not established guest enums. Source: the public contract.
 /// Viewport/scissor use Vulkan pixel coordinates. Without the depth/raster extension, raster state uses fill,
 /// one sample and all color channels. Duplicate tokens are rejected at use.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FirstDrawContract {
     /// Explicit mapping from caller tokens to supported primitive topologies.
     pub topologies: Vec<(u32, PrimitiveTopology)>,
@@ -33,8 +33,12 @@ pub struct FirstDrawContract {
     pub index_u32: u32,
     /// Host token that disables culling.
     pub cull_none: u64,
-    /// Host token for the supported four-byte color format.
-    pub rgba8: u64,
+    /// Explicit mapping from caller texture-format tokens to the color
+    /// formats swxbx draws into. Each must be a color format of one texel per
+    /// block that reads as float; the device's support for drawing into and
+    /// blending it is checked at the draw. Without an image contract only
+    /// R8G8B8A8_UNORM is drawn. Source: the public contract.
+    pub color_formats: Vec<(u64, vk::Format)>,
     /// Host token for a two-dimensional render target.
     pub target_2d: u64,
     /// Raw swizzle values accepted as identity for the first draw path.
@@ -43,11 +47,13 @@ pub struct FirstDrawContract {
     pub depth_raster: Option<DepthRasterContract>,
 }
 
-/// Host-selected tokens, not guest enum claims. See
-#[derive(Clone, Copy, Debug)]
+/// Host-selected tokens, not guest enum claims. See the public contract.
+#[derive(Clone)]
 pub struct DepthRasterContract {
-    /// Host token for the supported depth/stencil format.
-    pub d32s8: u64,
+    /// Explicit mapping from caller texture-format tokens to the depth formats
+    /// swxbx draws with. Each must be a depth format swxbx knows; the
+    /// device's support is checked at the draw and the clear. Source: the public contract.
+    pub depth_formats: Vec<(u64, vk::Format)>,
     /// Never, less, equal, less-or-equal, greater, not-equal, greater-or-equal, always.
     pub compare: [u64; 8],
     /// Keep, zero, replace, increment-clamp, decrement-clamp, invert, increment-wrap, decrement-wrap.
@@ -62,6 +68,83 @@ pub struct DepthRasterContract {
     pub clockwise: bool,
     /// Opt into the d0 slope, d1 constant, d2 clamp hypothesis.
     pub polygon_offset: bool,
+}
+
+impl std::fmt::Debug for FirstDrawContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirstDrawContract")
+            .field("topologies", &self.topologies)
+            .field("attribute_formats", &self.attribute_formats)
+            .field("attribute_state_stride", &self.attribute_state_stride)
+            .field("stream_state_stride", &self.stream_state_stride)
+            .field("index_u16", &self.index_u16)
+            .field("index_u32", &self.index_u32)
+            .field("cull_none", &self.cull_none)
+            .field(
+                "color_formats",
+                &super::formats::table_debug(&self.color_formats),
+            )
+            .field("target_2d", &self.target_2d)
+            .field("identity_swizzle", &self.identity_swizzle)
+            .field("depth_raster", &self.depth_raster)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DepthRasterContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DepthRasterContract")
+            .field(
+                "depth_formats",
+                &super::formats::table_debug(&self.depth_formats),
+            )
+            .field("compare", &self.compare)
+            .field("stencil_ops", &self.stencil_ops)
+            .field("faces", &self.faces)
+            .field("cull", &self.cull)
+            .field("polygon", &self.polygon)
+            .field("clockwise", &self.clockwise)
+            .field("polygon_offset", &self.polygon_offset)
+            .finish()
+    }
+}
+
+impl FirstDrawContract {
+    /// The color format a texture-format token draws into, when the table
+    /// maps it to exactly one.
+    pub(crate) fn color_format(&self, token: u64) -> Option<vk::Format> {
+        mapped(&self.color_formats, token)
+    }
+
+    /// Refuse a format table entry swxbx cannot draw with, naming it.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        fn table<T>(
+            what: &str,
+            entries: &[(u64, vk::Format)],
+            check: impl Fn(vk::Format) -> Result<T, String>,
+        ) -> Result<(), String> {
+            for (at, &(token, format)) in entries.iter().enumerate() {
+                if entries[..at].iter().any(|&(other, _)| other == token) {
+                    return Err(format!("{what} format token {token} is mapped twice"));
+                }
+                check(format).map_err(|why| format!("{what} format token {token}: {why}"))?;
+            }
+            Ok(())
+        }
+        table(
+            "color target",
+            &self.color_formats,
+            super::formats::color_target,
+        )?;
+        if let Some(depth) = &self.depth_raster {
+            table(
+                "depth target",
+                &depth.depth_formats,
+                super::formats::depth_target,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(
@@ -178,22 +261,31 @@ impl ColorAttachmentState {
 
 /// Interpreted pipeline state, also used for explicit cache retry.
 /// Enum integers are public Vulkan values. Retry validates them before use.
-#[derive(
-    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DrawPipelineState {
-    /// Required 32-lane subgroups for vertex and fragment stages, in that order.
-    #[serde(default)]
-    pub subgroup_size_32: [bool; 2],
+    /// Required 32-lane subgroups for each stage, indexed by
+    /// `GraphicsStage::slot`: vertex, fragment, then geometry. Records made
+    /// before geometry stages existed hold the first two.
+    #[serde(default, deserialize_with = "subgroup_sizes")]
+    pub subgroup_size_32: [bool; 3],
     /// Binding bits selecting one element per instance.
     #[serde(default)]
     pub instance_bindings: u32,
-    /// Zero selects the single-target retry contract. Otherwise 1 through 8.
+    /// Zero preserves the original single-target retry contract. Otherwise 1 through 8.
     pub color_count: u32,
     /// Per-attachment blend and channel-mask state.
     pub colors: [ColorAttachmentState; 8],
+    /// Raw Vulkan formats of the color attachments, in attachment order.
+    /// Records made before formats were part of the state drew to
+    /// R8G8B8A8_UNORM. Source: the public contract.
+    #[serde(default = "rgba8_attachments")]
+    pub color_formats: [i32; 8],
     /// Whether the pipeline includes a depth/stencil attachment.
     pub attachment: bool,
+    /// Raw Vulkan format of the depth/stencil attachment. Records made before
+    /// formats were part of the state drew with D32_SFLOAT_S8_UINT.
+    #[serde(default = "d32s8_attachment")]
+    pub depth_format: i32,
     /// Whether depth comparison is enabled.
     pub depth_test: bool,
     /// Whether passing fragments write depth.
@@ -214,6 +306,58 @@ pub struct DrawPipelineState {
     pub bias: [u32; 3],
 }
 
+fn subgroup_sizes<'de, D: serde::Deserializer<'de>>(from: D) -> Result<[bool; 3], D::Error> {
+    use serde::Deserialize;
+    match Vec::<bool>::deserialize(from)?.as_slice() {
+        &[vertex, fragment] => Ok([vertex, fragment, false]),
+        &[vertex, fragment, geometry] => Ok([vertex, fragment, geometry]),
+        other => Err(serde::de::Error::invalid_length(
+            other.len(),
+            &"two or three stage subgroup sizes",
+        )),
+    }
+}
+
+fn rgba8_attachments() -> [i32; 8] {
+    [vk::Format::R8G8B8A8_UNORM.as_raw(); 8]
+}
+
+fn d32s8_attachment() -> i32 {
+    vk::Format::D32_SFLOAT_S8_UINT.as_raw()
+}
+
+impl Default for DrawPipelineState {
+    fn default() -> Self {
+        Self {
+            subgroup_size_32: [false; 3],
+            instance_bindings: 0,
+            color_count: 0,
+            colors: [ColorAttachmentState::default(); 8],
+            color_formats: rgba8_attachments(),
+            attachment: false,
+            depth_format: d32s8_attachment(),
+            depth_test: false,
+            depth_write: false,
+            depth_compare: 0,
+            stencil_test: false,
+            stencil: [StencilState::default(); 2],
+            cull: 0,
+            polygon: 0,
+            clockwise: false,
+            bias: [0; 3],
+        }
+    }
+}
+
+impl DrawPipelineState {
+    /// The color attachment formats in use.
+    pub(crate) fn color_formats(&self) -> impl Iterator<Item = vk::Format> + '_ {
+        self.color_formats[..self.color_count.max(1) as usize]
+            .iter()
+            .map(|&raw| vk::Format::from_raw(raw))
+    }
+}
+
 /// Primitive assembly supported by the bounded draw path.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PrimitiveTopology {
@@ -226,18 +370,154 @@ pub enum PrimitiveTopology {
 }
 
 impl PrimitiveTopology {
-    fn vk(self) -> vk::PrimitiveTopology {
+    /// Every topology the draw path assembles.
+    pub const ALL: [Self; 3] = [Self::TriangleList, Self::TriangleStrip, Self::TriangleFan];
+
+    /// The Vulkan topology the draw path assembles with.
+    pub fn vk(self) -> vk::PrimitiveTopology {
         match self {
             Self::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
             Self::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
             Self::TriangleFan => vk::PrimitiveTopology::TRIANGLE_FAN,
         }
     }
+
+    /// The primitive a geometry stage receives from this assembly.
+    pub(crate) fn geometry_input(self) -> crate::startup_cache::InputPrimitive {
+        match self {
+            Self::TriangleList | Self::TriangleStrip | Self::TriangleFan => {
+                crate::startup_cache::InputPrimitive::Triangles
+            }
+        }
+    }
 }
 
-/// Float-converting vertex formats from public Vulkan documentation,
+/// Vertex attribute formats: every Vulkan format of the UNORM, SNORM, USCALED,
+/// SSCALED, UINT, SINT and SFLOAT families at 8, 16 and 32 bits with one to
+/// four components (public Vulkan documentation, the public contract). Whether the
+/// device reads one from a vertex buffer is its VERTEX_BUFFER format feature.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VertexFormat {
+    /// One unsigned 8-bit, normalized to zero through one component.
+    Unorm8,
+    /// Two unsigned 8-bit, normalized to zero through one components.
+    Unorm8x2,
+    /// Three unsigned 8-bit, normalized to zero through one components.
+    Unorm8x3,
+    /// Four unsigned 8-bit, normalized to zero through one components.
+    Unorm8x4,
+    /// One unsigned 16-bit, normalized to zero through one component.
+    Unorm16,
+    /// Two unsigned 16-bit, normalized to zero through one components.
+    Unorm16x2,
+    /// Three unsigned 16-bit, normalized to zero through one components.
+    Unorm16x3,
+    /// Four unsigned 16-bit, normalized to zero through one components.
+    Unorm16x4,
+    /// One signed 8-bit, normalized to minus one through one component.
+    Snorm8,
+    /// Two signed 8-bit, normalized to minus one through one components.
+    Snorm8x2,
+    /// Three signed 8-bit, normalized to minus one through one components.
+    Snorm8x3,
+    /// Four signed 8-bit, normalized to minus one through one components.
+    Snorm8x4,
+    /// One signed 16-bit, normalized to minus one through one component.
+    Snorm16,
+    /// Two signed 16-bit, normalized to minus one through one components.
+    Snorm16x2,
+    /// Three signed 16-bit, normalized to minus one through one components.
+    Snorm16x3,
+    /// Four signed 16-bit, normalized to minus one through one components.
+    Snorm16x4,
+    /// One unsigned 8-bit, converted to float unnormalized component.
+    Uscaled8,
+    /// Two unsigned 8-bit, converted to float unnormalized components.
+    Uscaled8x2,
+    /// Three unsigned 8-bit, converted to float unnormalized components.
+    Uscaled8x3,
+    /// Four unsigned 8-bit, converted to float unnormalized components.
+    Uscaled8x4,
+    /// One unsigned 16-bit, converted to float unnormalized component.
+    Uscaled16,
+    /// Two unsigned 16-bit, converted to float unnormalized components.
+    Uscaled16x2,
+    /// Three unsigned 16-bit, converted to float unnormalized components.
+    Uscaled16x3,
+    /// Four unsigned 16-bit, converted to float unnormalized components.
+    Uscaled16x4,
+    /// One signed 8-bit, converted to float unnormalized component.
+    Sscaled8,
+    /// Two signed 8-bit, converted to float unnormalized components.
+    Sscaled8x2,
+    /// Three signed 8-bit, converted to float unnormalized components.
+    Sscaled8x3,
+    /// Four signed 8-bit, converted to float unnormalized components.
+    Sscaled8x4,
+    /// One signed 16-bit, converted to float unnormalized component.
+    Sscaled16,
+    /// Two signed 16-bit, converted to float unnormalized components.
+    Sscaled16x2,
+    /// Three signed 16-bit, converted to float unnormalized components.
+    Sscaled16x3,
+    /// Four signed 16-bit, converted to float unnormalized components.
+    Sscaled16x4,
+    /// One unsigned 8-bit integer, read as an integer component.
+    Uint8,
+    /// Two unsigned 8-bit integer, read as an integer components.
+    Uint8x2,
+    /// Three unsigned 8-bit integer, read as an integer components.
+    Uint8x3,
+    /// Four unsigned 8-bit integer, read as an integer components.
+    Uint8x4,
+    /// One unsigned 16-bit integer, read as an integer component.
+    Uint16,
+    /// Two unsigned 16-bit integer, read as an integer components.
+    Uint16x2,
+    /// Three unsigned 16-bit integer, read as an integer components.
+    Uint16x3,
+    /// Four unsigned 16-bit integer, read as an integer components.
+    Uint16x4,
+    /// One unsigned 32-bit integer, read as an integer component.
+    Uint32,
+    /// Two unsigned 32-bit integer, read as an integer components.
+    Uint32x2,
+    /// Three unsigned 32-bit integer, read as an integer components.
+    Uint32x3,
+    /// Four unsigned 32-bit integer, read as an integer components.
+    Uint32x4,
+    /// One signed 8-bit integer, read as an integer component.
+    Sint8,
+    /// Two signed 8-bit integer, read as an integer components.
+    Sint8x2,
+    /// Three signed 8-bit integer, read as an integer components.
+    Sint8x3,
+    /// Four signed 8-bit integer, read as an integer components.
+    Sint8x4,
+    /// One signed 16-bit integer, read as an integer component.
+    Sint16,
+    /// Two signed 16-bit integer, read as an integer components.
+    Sint16x2,
+    /// Three signed 16-bit integer, read as an integer components.
+    Sint16x3,
+    /// Four signed 16-bit integer, read as an integer components.
+    Sint16x4,
+    /// One signed 32-bit integer, read as an integer component.
+    Sint32,
+    /// Two signed 32-bit integer, read as an integer components.
+    Sint32x2,
+    /// Three signed 32-bit integer, read as an integer components.
+    Sint32x3,
+    /// Four signed 32-bit integer, read as an integer components.
+    Sint32x4,
+    /// One 16-bit floating-point component.
+    Half,
+    /// Two 16-bit floating-point components.
+    Half2,
+    /// Three 16-bit floating-point components.
+    Half3,
+    /// Four 16-bit floating-point components.
+    Half4,
     /// One 32-bit floating-point component.
     Float,
     /// Two 32-bit floating-point components.
@@ -246,66 +526,242 @@ pub enum VertexFormat {
     Float3,
     /// Four 32-bit floating-point components.
     Float4,
-    /// Two 16-bit floating-point components.
-    Half2,
-    /// Four 16-bit floating-point components.
-    Half4,
-    /// Four unsigned 8-bit components normalized to zero through one.
-    Unorm8x4,
-    /// Four signed 8-bit components normalized to minus one through one.
-    Snorm8x4,
-    /// Two unsigned 16-bit components normalized to zero through one.
-    Unorm16x2,
-    /// Four unsigned 16-bit components normalized to zero through one.
-    Unorm16x4,
-    /// Two signed 16-bit components normalized to minus one through one.
-    Snorm16x2,
-    /// Four signed 16-bit components normalized to minus one through one.
-    Snorm16x4,
+}
+
+/// How the vertex shader receives an attribute's components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VertexNumeric {
+    /// Floating-point values (float, normalized and scaled formats).
+    Float,
+    /// Unsigned integers.
+    Uint,
+    /// Signed integers.
+    Sint,
 }
 
 impl VertexFormat {
-    pub(crate) fn vk(self) -> vk::Format {
+    /// Every vertex format the draw path names.
+    pub const ALL: [Self; 64] = [
+        Self::Unorm8,
+        Self::Unorm8x2,
+        Self::Unorm8x3,
+        Self::Unorm8x4,
+        Self::Unorm16,
+        Self::Unorm16x2,
+        Self::Unorm16x3,
+        Self::Unorm16x4,
+        Self::Snorm8,
+        Self::Snorm8x2,
+        Self::Snorm8x3,
+        Self::Snorm8x4,
+        Self::Snorm16,
+        Self::Snorm16x2,
+        Self::Snorm16x3,
+        Self::Snorm16x4,
+        Self::Uscaled8,
+        Self::Uscaled8x2,
+        Self::Uscaled8x3,
+        Self::Uscaled8x4,
+        Self::Uscaled16,
+        Self::Uscaled16x2,
+        Self::Uscaled16x3,
+        Self::Uscaled16x4,
+        Self::Sscaled8,
+        Self::Sscaled8x2,
+        Self::Sscaled8x3,
+        Self::Sscaled8x4,
+        Self::Sscaled16,
+        Self::Sscaled16x2,
+        Self::Sscaled16x3,
+        Self::Sscaled16x4,
+        Self::Uint8,
+        Self::Uint8x2,
+        Self::Uint8x3,
+        Self::Uint8x4,
+        Self::Uint16,
+        Self::Uint16x2,
+        Self::Uint16x3,
+        Self::Uint16x4,
+        Self::Uint32,
+        Self::Uint32x2,
+        Self::Uint32x3,
+        Self::Uint32x4,
+        Self::Sint8,
+        Self::Sint8x2,
+        Self::Sint8x3,
+        Self::Sint8x4,
+        Self::Sint16,
+        Self::Sint16x2,
+        Self::Sint16x3,
+        Self::Sint16x4,
+        Self::Sint32,
+        Self::Sint32x2,
+        Self::Sint32x3,
+        Self::Sint32x4,
+        Self::Half,
+        Self::Half2,
+        Self::Half3,
+        Self::Half4,
+        Self::Float,
+        Self::Float2,
+        Self::Float3,
+        Self::Float4,
+    ];
+
+    /// The Vulkan format the draw path reads the attribute with.
+    pub fn vk(self) -> vk::Format {
         match self {
+            Self::Unorm8 => vk::Format::R8_UNORM,
+            Self::Unorm8x2 => vk::Format::R8G8_UNORM,
+            Self::Unorm8x3 => vk::Format::R8G8B8_UNORM,
+            Self::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
+            Self::Unorm16 => vk::Format::R16_UNORM,
+            Self::Unorm16x2 => vk::Format::R16G16_UNORM,
+            Self::Unorm16x3 => vk::Format::R16G16B16_UNORM,
+            Self::Unorm16x4 => vk::Format::R16G16B16A16_UNORM,
+            Self::Snorm8 => vk::Format::R8_SNORM,
+            Self::Snorm8x2 => vk::Format::R8G8_SNORM,
+            Self::Snorm8x3 => vk::Format::R8G8B8_SNORM,
+            Self::Snorm8x4 => vk::Format::R8G8B8A8_SNORM,
+            Self::Snorm16 => vk::Format::R16_SNORM,
+            Self::Snorm16x2 => vk::Format::R16G16_SNORM,
+            Self::Snorm16x3 => vk::Format::R16G16B16_SNORM,
+            Self::Snorm16x4 => vk::Format::R16G16B16A16_SNORM,
+            Self::Uscaled8 => vk::Format::R8_USCALED,
+            Self::Uscaled8x2 => vk::Format::R8G8_USCALED,
+            Self::Uscaled8x3 => vk::Format::R8G8B8_USCALED,
+            Self::Uscaled8x4 => vk::Format::R8G8B8A8_USCALED,
+            Self::Uscaled16 => vk::Format::R16_USCALED,
+            Self::Uscaled16x2 => vk::Format::R16G16_USCALED,
+            Self::Uscaled16x3 => vk::Format::R16G16B16_USCALED,
+            Self::Uscaled16x4 => vk::Format::R16G16B16A16_USCALED,
+            Self::Sscaled8 => vk::Format::R8_SSCALED,
+            Self::Sscaled8x2 => vk::Format::R8G8_SSCALED,
+            Self::Sscaled8x3 => vk::Format::R8G8B8_SSCALED,
+            Self::Sscaled8x4 => vk::Format::R8G8B8A8_SSCALED,
+            Self::Sscaled16 => vk::Format::R16_SSCALED,
+            Self::Sscaled16x2 => vk::Format::R16G16_SSCALED,
+            Self::Sscaled16x3 => vk::Format::R16G16B16_SSCALED,
+            Self::Sscaled16x4 => vk::Format::R16G16B16A16_SSCALED,
+            Self::Uint8 => vk::Format::R8_UINT,
+            Self::Uint8x2 => vk::Format::R8G8_UINT,
+            Self::Uint8x3 => vk::Format::R8G8B8_UINT,
+            Self::Uint8x4 => vk::Format::R8G8B8A8_UINT,
+            Self::Uint16 => vk::Format::R16_UINT,
+            Self::Uint16x2 => vk::Format::R16G16_UINT,
+            Self::Uint16x3 => vk::Format::R16G16B16_UINT,
+            Self::Uint16x4 => vk::Format::R16G16B16A16_UINT,
+            Self::Uint32 => vk::Format::R32_UINT,
+            Self::Uint32x2 => vk::Format::R32G32_UINT,
+            Self::Uint32x3 => vk::Format::R32G32B32_UINT,
+            Self::Uint32x4 => vk::Format::R32G32B32A32_UINT,
+            Self::Sint8 => vk::Format::R8_SINT,
+            Self::Sint8x2 => vk::Format::R8G8_SINT,
+            Self::Sint8x3 => vk::Format::R8G8B8_SINT,
+            Self::Sint8x4 => vk::Format::R8G8B8A8_SINT,
+            Self::Sint16 => vk::Format::R16_SINT,
+            Self::Sint16x2 => vk::Format::R16G16_SINT,
+            Self::Sint16x3 => vk::Format::R16G16B16_SINT,
+            Self::Sint16x4 => vk::Format::R16G16B16A16_SINT,
+            Self::Sint32 => vk::Format::R32_SINT,
+            Self::Sint32x2 => vk::Format::R32G32_SINT,
+            Self::Sint32x3 => vk::Format::R32G32B32_SINT,
+            Self::Sint32x4 => vk::Format::R32G32B32A32_SINT,
+            Self::Half => vk::Format::R16_SFLOAT,
+            Self::Half2 => vk::Format::R16G16_SFLOAT,
+            Self::Half3 => vk::Format::R16G16B16_SFLOAT,
+            Self::Half4 => vk::Format::R16G16B16A16_SFLOAT,
             Self::Float => vk::Format::R32_SFLOAT,
             Self::Float2 => vk::Format::R32G32_SFLOAT,
             Self::Float3 => vk::Format::R32G32B32_SFLOAT,
             Self::Float4 => vk::Format::R32G32B32A32_SFLOAT,
-            Self::Half2 => vk::Format::R16G16_SFLOAT,
-            Self::Half4 => vk::Format::R16G16B16A16_SFLOAT,
-            Self::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
-            Self::Snorm8x4 => vk::Format::R8G8B8A8_SNORM,
-            Self::Unorm16x2 => vk::Format::R16G16_UNORM,
-            Self::Unorm16x4 => vk::Format::R16G16B16A16_UNORM,
-            Self::Snorm16x2 => vk::Format::R16G16_SNORM,
-            Self::Snorm16x4 => vk::Format::R16G16B16A16_SNORM,
         }
     }
 
-    pub(crate) fn layout(self) -> (u32, u32) {
+    /// Component size in bytes, component count and the numeric class the
+    /// shader receives.
+    fn parts(self) -> (u32, u32, VertexNumeric) {
         match self {
-            Self::Float => (4, 4),
-            Self::Float2 => (8, 4),
-            Self::Float3 => (12, 4),
-            Self::Float4 => (16, 4),
-            Self::Half2 | Self::Unorm16x2 | Self::Snorm16x2 => (4, 2),
-            Self::Half4 | Self::Unorm16x4 | Self::Snorm16x4 => (8, 2),
-            Self::Unorm8x4 | Self::Snorm8x4 => (4, 1),
+            Self::Unorm8 => (1, 1, VertexNumeric::Float),
+            Self::Unorm8x2 => (1, 2, VertexNumeric::Float),
+            Self::Unorm8x3 => (1, 3, VertexNumeric::Float),
+            Self::Unorm8x4 => (1, 4, VertexNumeric::Float),
+            Self::Unorm16 => (2, 1, VertexNumeric::Float),
+            Self::Unorm16x2 => (2, 2, VertexNumeric::Float),
+            Self::Unorm16x3 => (2, 3, VertexNumeric::Float),
+            Self::Unorm16x4 => (2, 4, VertexNumeric::Float),
+            Self::Snorm8 => (1, 1, VertexNumeric::Float),
+            Self::Snorm8x2 => (1, 2, VertexNumeric::Float),
+            Self::Snorm8x3 => (1, 3, VertexNumeric::Float),
+            Self::Snorm8x4 => (1, 4, VertexNumeric::Float),
+            Self::Snorm16 => (2, 1, VertexNumeric::Float),
+            Self::Snorm16x2 => (2, 2, VertexNumeric::Float),
+            Self::Snorm16x3 => (2, 3, VertexNumeric::Float),
+            Self::Snorm16x4 => (2, 4, VertexNumeric::Float),
+            Self::Uscaled8 => (1, 1, VertexNumeric::Float),
+            Self::Uscaled8x2 => (1, 2, VertexNumeric::Float),
+            Self::Uscaled8x3 => (1, 3, VertexNumeric::Float),
+            Self::Uscaled8x4 => (1, 4, VertexNumeric::Float),
+            Self::Uscaled16 => (2, 1, VertexNumeric::Float),
+            Self::Uscaled16x2 => (2, 2, VertexNumeric::Float),
+            Self::Uscaled16x3 => (2, 3, VertexNumeric::Float),
+            Self::Uscaled16x4 => (2, 4, VertexNumeric::Float),
+            Self::Sscaled8 => (1, 1, VertexNumeric::Float),
+            Self::Sscaled8x2 => (1, 2, VertexNumeric::Float),
+            Self::Sscaled8x3 => (1, 3, VertexNumeric::Float),
+            Self::Sscaled8x4 => (1, 4, VertexNumeric::Float),
+            Self::Sscaled16 => (2, 1, VertexNumeric::Float),
+            Self::Sscaled16x2 => (2, 2, VertexNumeric::Float),
+            Self::Sscaled16x3 => (2, 3, VertexNumeric::Float),
+            Self::Sscaled16x4 => (2, 4, VertexNumeric::Float),
+            Self::Uint8 => (1, 1, VertexNumeric::Uint),
+            Self::Uint8x2 => (1, 2, VertexNumeric::Uint),
+            Self::Uint8x3 => (1, 3, VertexNumeric::Uint),
+            Self::Uint8x4 => (1, 4, VertexNumeric::Uint),
+            Self::Uint16 => (2, 1, VertexNumeric::Uint),
+            Self::Uint16x2 => (2, 2, VertexNumeric::Uint),
+            Self::Uint16x3 => (2, 3, VertexNumeric::Uint),
+            Self::Uint16x4 => (2, 4, VertexNumeric::Uint),
+            Self::Uint32 => (4, 1, VertexNumeric::Uint),
+            Self::Uint32x2 => (4, 2, VertexNumeric::Uint),
+            Self::Uint32x3 => (4, 3, VertexNumeric::Uint),
+            Self::Uint32x4 => (4, 4, VertexNumeric::Uint),
+            Self::Sint8 => (1, 1, VertexNumeric::Sint),
+            Self::Sint8x2 => (1, 2, VertexNumeric::Sint),
+            Self::Sint8x3 => (1, 3, VertexNumeric::Sint),
+            Self::Sint8x4 => (1, 4, VertexNumeric::Sint),
+            Self::Sint16 => (2, 1, VertexNumeric::Sint),
+            Self::Sint16x2 => (2, 2, VertexNumeric::Sint),
+            Self::Sint16x3 => (2, 3, VertexNumeric::Sint),
+            Self::Sint16x4 => (2, 4, VertexNumeric::Sint),
+            Self::Sint32 => (4, 1, VertexNumeric::Sint),
+            Self::Sint32x2 => (4, 2, VertexNumeric::Sint),
+            Self::Sint32x3 => (4, 3, VertexNumeric::Sint),
+            Self::Sint32x4 => (4, 4, VertexNumeric::Sint),
+            Self::Half => (2, 1, VertexNumeric::Float),
+            Self::Half2 => (2, 2, VertexNumeric::Float),
+            Self::Half3 => (2, 3, VertexNumeric::Float),
+            Self::Half4 => (2, 4, VertexNumeric::Float),
+            Self::Float => (4, 1, VertexNumeric::Float),
+            Self::Float2 => (4, 2, VertexNumeric::Float),
+            Self::Float3 => (4, 3, VertexNumeric::Float),
+            Self::Float4 => (4, 4, VertexNumeric::Float),
         }
+    }
+
+    /// Bytes per attribute and the alignment of its components.
+    pub(crate) fn layout(self) -> (u32, u32) {
+        let (size, count, _) = self.parts();
+        (size * count, size)
     }
 
     fn components(self) -> u32 {
-        match self {
-            Self::Float => 1,
-            Self::Float2 | Self::Half2 | Self::Unorm16x2 | Self::Snorm16x2 => 2,
-            Self::Float3 => 3,
-            Self::Float4
-            | Self::Half4
-            | Self::Unorm8x4
-            | Self::Snorm8x4
-            | Self::Unorm16x4
-            | Self::Snorm16x4 => 4,
-        }
+        self.parts().1
+    }
+
+    /// How the vertex shader receives the components.
+    pub fn numeric(self) -> VertexNumeric {
+        self.parts().2
     }
 }
 
@@ -344,17 +800,82 @@ pub struct VertexAttribute {
     pub offset: u32,
 }
 
+/// The translated module of each stage a draw runs, in pipeline order: one
+/// vertex stage, at most one geometry stage, then one fragment stage.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub(crate) struct GraphicsStages(Vec<(GraphicsStage, Vec<u32>)>);
+
+impl GraphicsStages {
+    /// Order modules by the stage each one's entry point names.
+    fn new(stages: &[Vec<u32>]) -> Result<Self, String> {
+        let mut result: Vec<(GraphicsStage, Vec<u32>)> = Vec::with_capacity(stages.len());
+        for words in stages {
+            let stage = GraphicsStage::of(words)?;
+            if result.iter().any(|(known, _)| *known == stage) {
+                return Err("duplicate graphics stage".into());
+            }
+            result.push((stage, words.clone()));
+        }
+        result.sort_by_key(|(stage, _)| *stage);
+        match result.as_slice() {
+            [(GraphicsStage::Vertex, _), .., (GraphicsStage::Fragment, _)] => Ok(Self(result)),
+            _ => Err("a draw needs a vertex stage and a fragment stage".into()),
+        }
+    }
+
+    /// The stages of fixed-function library parts, which run no shader.
+    pub(super) fn fixed() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Each stage with its module, in pipeline order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (GraphicsStage, &[u32])> {
+        self.0
+            .iter()
+            .map(|(stage, words)| (*stage, words.as_slice()))
+    }
+
+    /// The shader stage flags of every stage present.
+    pub(super) fn flags(&self) -> vk::ShaderStageFlags {
+        self.iter()
+            .fold(vk::ShaderStageFlags::empty(), |flags, (stage, _)| {
+                flags | stage.flags()
+            })
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether `stages` are these modules, in any order.
+    fn holds(&self, stages: &[Arc<Stage>]) -> bool {
+        stages.len() == self.len()
+            && stages
+                .iter()
+                .all(|stage| self.iter().any(|(_, words)| words == stage.words))
+    }
+
+    #[cfg(test)]
+    pub(super) fn words_mut(&mut self, stage: GraphicsStage) -> &mut Vec<u32> {
+        &mut self
+            .0
+            .iter_mut()
+            .find(|(known, _)| *known == stage)
+            .expect("stage present")
+            .1
+    }
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct Key {
-    pub(super) vertex: Vec<u32>,
-    pub(super) fragment: Vec<u32>,
+    pub(super) stages: GraphicsStages,
     pub(super) input: VertexInput,
     pub(super) topology: PrimitiveTopology,
     pub(super) storage: bool,
     pub(super) state: DrawPipelineState,
 }
 
-/// Host choice when a draw needs unfinished compilation.
+/// Host choice when a draw needs unfinished compilation. Evidence: the public contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PendingDrawPolicy {
     /// Wait for translation, queue admission, compilation and linking at submission.
@@ -436,9 +957,15 @@ pub(crate) struct GraphicsPipelines {
     requires_storage: bool,
     pool: Compiler,
     policy: PendingDrawPolicy,
-    ready_ids: HashMap<u64, Vec<usize>>,
-    ready: Vec<(Key, Arc<GraphicsPipeline>)>,
-    descriptors: HashMap<vk::Pipeline, DescriptorCache>,
+    ready_ids: crate::keymap::KeyMap<u64, Vec<usize>>,
+    /// Each ready pipeline with the accepted stages that first requested it.
+    /// A later request naming the same stage objects is that pipeline by
+    /// identity; the stored stages keep those identities from being reused.
+    ready: Vec<(Key, Vec<Arc<Stage>>, Arc<GraphicsPipeline>)>,
+    /// The ready pipeline the previous request named. Consecutive draws
+    /// usually share one, and identity plus state equality finds it unhashed.
+    last: Option<usize>,
+    descriptors: crate::keymap::KeyMap<vk::Pipeline, DescriptorCache>,
 }
 impl GraphicsPipelines {
     /// Create reusable execution resources; return None if Vulkan setup fails.
@@ -482,10 +1009,11 @@ impl GraphicsPipelines {
             driver,
             pool,
             policy: PendingDrawPolicy::default(),
-            ready_ids: HashMap::new(),
+            ready_ids: Default::default(),
             translated: HashMap::new(),
             ready: Vec::new(),
-            descriptors: HashMap::new(),
+            last: None,
+            descriptors: Default::default(),
             requires_storage: u64::from(limits.max_uniform_buffer_range) < BANK_SIZE,
         })
     }
@@ -538,29 +1066,43 @@ impl GraphicsPipelines {
         let _span = crate::draw_metrics::Span::new(0);
         use std::hash::{Hash, Hasher};
         let storage = self.uses_storage(storage);
-        let mut shader_hashes = [0; 2];
-        if stages.len() == 2 {
-            for (hash, stage) in shader_hashes.iter_mut().zip(stages) {
-                *hash = stage.hash;
+        let same = |known: &[Arc<Stage>]| {
+            known.len() == stages.len()
+                && known
+                    .iter()
+                    .zip(stages)
+                    .all(|(known, stage)| Arc::ptr_eq(known, stage))
+        };
+        if let Some(id) = self.last {
+            let (key, known, pipeline) = &self.ready[id];
+            if same(known)
+                && key.input == input
+                && key.topology == topology
+                && key.state == state
+                && key.storage == storage
+            {
+                self.pool.hit();
+                return Ok(Some(pipeline.clone()));
             }
-            shader_hashes.sort_unstable();
         }
+        let mut shader_hashes: Vec<u64> = stages.iter().map(|stage| stage.hash).collect();
+        shader_hashes.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (&shader_hashes, &input, topology, state, storage).hash(&mut hasher);
         let fingerprint = hasher.finish();
         if let Some(ids) = self.ready_ids.get(&fingerprint) {
             for &id in ids {
-                let (key, pipeline) = &self.ready[id];
+                let (key, known, pipeline) = &self.ready[id];
                 if key.input == input
                     && key.topology == topology
                     && key.state == state
                     && key.storage == storage
-                    && stages.len() == 2
-                    && ((stages[0].words == key.vertex && stages[1].words == key.fragment)
-                        || (stages[1].words == key.vertex && stages[0].words == key.fragment))
+                    && (same(known) || key.stages.holds(stages))
                 {
                     self.pool.hit();
-                    return Ok(Some(pipeline.clone()));
+                    let pipeline = pipeline.clone();
+                    self.last = Some(id);
+                    return Ok(Some(pipeline));
                 }
             }
         }
@@ -577,8 +1119,9 @@ impl GraphicsPipelines {
         )?;
         if let Some(pipeline) = &pipeline {
             let id = self.ready.len();
-            self.ready.push((key, pipeline.clone()));
+            self.ready.push((key, stages.to_vec(), pipeline.clone()));
             self.ready_ids.entry(fingerprint).or_default().push(id);
+            self.last = Some(id);
         }
         Ok(pipeline)
     }
@@ -589,6 +1132,19 @@ impl GraphicsPipelines {
         self.policy = policy;
         Ok(())
     }
+    /// Stop a draw with a reason naming the fact that was wrong. The reason
+    /// goes to standard error and `swxbx_last_error` through
+    /// `unsupported::refuse`, and to the graphics diagnostics. Source: the public contract.
+    pub(crate) fn refuse_draw(
+        &self,
+        status: crate::Status,
+        reason: impl std::fmt::Display,
+    ) -> crate::Status {
+        let reason = reason.to_string();
+        self.driver.diagnostic(format!("refused draw: {reason}"));
+        crate::unsupported::refuse(status, reason)
+    }
+
     pub(crate) fn log_skipped_draw(&self, reason: &str) {
         let message = format!("skipped draw: {reason}");
         eprintln!("{message}");
@@ -605,19 +1161,14 @@ impl GraphicsPipelines {
         recipe: &crate::startup_cache::PipelineRecipe,
     ) -> Result<bool, String> {
         let mut state = recipe.state;
-        state.subgroup_size_32 = [false; 2];
+        state.subgroup_size_32 = [false; 3];
         for stage in stages {
             self.driver
                 .context
                 .shader_features
                 .validate_translated_shader(stage)?;
             if stage.requires_subgroup_size_32 {
-                let index = match execution_model(&stage.words)? {
-                    0 => 0,
-                    4 => 1,
-                    _ => return Err("unsupported graphics stage".into()),
-                };
-                state.subgroup_size_32[index] = true;
+                state.subgroup_size_32[GraphicsStage::of(&stage.words)?.slot()] = true;
             }
         }
         let words: Vec<_> = stages.iter().map(|s| s.words.clone()).collect();
@@ -690,10 +1241,15 @@ impl GraphicsPipelines {
     }
 }
 impl Key {
+    /// Each stage reads only what the one before it writes: the vertex
+    /// stage reads bound attributes, and the fragment stage writes every
+    /// colour target.
     pub(super) fn validate_interfaces(&self) -> Result<(), String> {
-        let inputs = float_interface(&self.vertex, 1)?;
-        let vertex_outputs = float_interface(&self.vertex, 3)?;
-        let fragment_inputs = float_interface(&self.fragment, 1)?;
+        let stages: Vec<_> = self.stages.iter().collect();
+        let Some(&(_, vertex)) = stages.first() else {
+            return Err("a draw needs a vertex stage".into());
+        };
+        let inputs = float_interface(vertex, 1)?;
         if inputs.is_empty()
             || inputs.iter().any(|&(location, components)| {
                 self.input
@@ -701,22 +1257,106 @@ impl Key {
                     .get(location as usize)
                     .is_none_or(|attribute| attribute.format.components() > components)
             })
-            || fragment_inputs
-                .iter()
-                .any(|input| !vertex_outputs.contains(input))
-            || float_interface(&self.fragment, 3)?
+        {
+            return Err(format!(
+                "incompatible graphics interfaces: shader_inputs={inputs:?} bound_attributes={:?}",
+                self.input.attributes,
+            ));
+        }
+        for pair in stages.windows(2) {
+            let ((producer, written), (consumer, read)) = (pair[0], pair[1]);
+            let outputs = float_interface(written, 3)?;
+            let inputs = float_interface(read, 1)?;
+            if inputs.iter().any(|input| !outputs.contains(input)) {
+                return Err(format!(
+                    "incompatible graphics interfaces: {producer:?} outputs={outputs:?} {consumer:?} inputs={inputs:?}"
+                ));
+            }
+        }
+        if let Some(&(_, fragment)) = stages.last() {
+            let outputs = float_interface(fragment, 3)?;
+            if outputs
                 != (0..self.state.color_count.max(1))
                     .map(|i| (i, 4))
                     .collect::<Vec<_>>()
-        {
-            return Err(format!(
-                "incompatible graphics interfaces: shader_inputs={inputs:?} bound_attributes={:?} vertex_outputs={vertex_outputs:?} fragment_inputs={fragment_inputs:?} fragment_outputs={:?} color_count={}",
-                self.input.attributes,
-                float_interface(&self.fragment, 3)?,
-                self.state.color_count,
-            ));
+            {
+                return Err(format!(
+                    "incompatible graphics interfaces: fragment_outputs={outputs:?} color_count={}",
+                    self.state.color_count,
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// A geometry stage reads the primitive this draw assembles and stays
+    /// within the device's geometry limits.
+    fn validate_geometry(&self, limits: &vk::PhysicalDeviceLimits) -> Result<(), String> {
+        for (stage, words) in self.stages.iter() {
+            if stage != GraphicsStage::Geometry {
+                continue;
+            }
+            let modes = execution_modes(words)?;
+            let input = modes
+                .iter()
+                .find_map(|&(mode, _)| match mode {
+                    19 => Some("points"),
+                    20 => Some("lines"),
+                    21 => Some("lines with adjacency"),
+                    22 => Some("triangles"),
+                    23 => Some("triangles with adjacency"),
+                    _ => None,
+                })
+                .ok_or("the geometry stage declares no input primitive")?;
+            if input != "triangles" {
+                return Err(format!(
+                    "the geometry stage reads {input} but the draw assembles triangles"
+                ));
+            }
+            for &(mode, operands) in &modes {
+                let (limit, name) = match mode {
+                    26 => (limits.max_geometry_output_vertices, "output vertices"),
+                    0 => (limits.max_geometry_shader_invocations, "invocations"),
+                    _ => continue,
+                };
+                let &[value] = operands else {
+                    return Err(format!("the geometry stage's {name} mode is malformed"));
+                };
+                if value > limit {
+                    return Err(format!(
+                        "the geometry stage declares {value} {name}; this device allows {limit}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a stage writes the storage buffers holding constant banks.
+    fn writes_banks(&self) -> bool {
+        self.storage
+            && self
+                .stages
+                .iter()
+                .any(|(_, words)| super::memory::storage_writes(words))
+    }
+
+    /// Whether a stage writes guest memory through physical addresses.
+    fn global_writes(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|(_, words)| super::memory::physical_writes(words))
+    }
+
+    /// Whether draws may share one recording: no stage declares a
+    /// physical storage buffer pointer type.
+    fn batch_safe(&self) -> bool {
+        self.stages.iter().all(|(_, words)| {
+            instructions(words).is_ok_and(|ops| {
+                !ops.iter()
+                    .any(|&(op, args)| op == 32 && args.get(1) == Some(&5349))
+            })
+        })
     }
 
     pub(crate) fn new(
@@ -748,32 +1388,46 @@ impl Key {
         {
             return Err("invalid interpreted depth or raster state".into());
         }
-        if stages.len() != 2 {
-            return Err("first draw requires exactly two translated stages".into());
+        for format in state.color_formats() {
+            super::formats::color_target(format)?;
         }
-        let mut vertex = None;
-        let mut fragment = None;
-        for words in stages {
-            let model = execution_model(words)?;
-            let slot = match model {
-                0 => &mut vertex,
-                4 => &mut fragment,
-                _ => return Err("unsupported graphics stage".into()),
-            };
-            if slot.replace(words).is_some() {
-                return Err("duplicate graphics stage".into());
-            }
+        if state.attachment {
+            super::formats::depth_target(vk::Format::from_raw(state.depth_format))?;
         }
-        let vertex = vertex.ok_or("missing vertex stage")?;
-        let fragment = fragment.ok_or("missing fragment stage")?;
-        Ok(Self {
-            vertex: vertex.clone(),
-            fragment: fragment.clone(),
+        let key = Self {
+            stages: GraphicsStages::new(stages)?,
             input,
             topology,
             storage,
             state,
-        })
+        };
+        key.validate_attribute_numerics()?;
+        Ok(key)
+    }
+
+    /// An integer attribute reaches the vertex shader only through an
+    /// integer input of its signedness (Vulkan "Vertex Input Extraction").
+    /// The draw path admits float vertex inputs only, so a location the
+    /// shader reads from an integer attribute is refused here, where the
+    /// draw is asked for.
+    fn validate_attribute_numerics(&self) -> Result<(), String> {
+        let Some((_, vertex)) = self.stages.iter().next() else {
+            return Ok(());
+        };
+        let read = float_interface(vertex, 1)?;
+        for (location, attribute) in self.input.attributes.iter().enumerate() {
+            if attribute.format.numeric() != VertexNumeric::Float
+                && read.iter().any(|&(at, _)| at as usize == location)
+            {
+                return Err(format!(
+                    "vertex attribute {location} has the integer format {:?} (VkFormat {}), but \
+                     the vertex shader reads location {location} as 32-bit float",
+                    attribute.format,
+                    attribute.format.vk().as_raw()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -831,8 +1485,22 @@ pub(crate) fn execution_model(words: &[u32]) -> Result<u32, String> {
     }
 }
 
+/// Each OpExecutionMode of a module: the mode and its literal operands.
+fn execution_modes(words: &[u32]) -> Result<Vec<(u32, &[u32])>, String> {
+    Ok(instructions(words)?
+        .into_iter()
+        .filter_map(|(op, args)| match (op, args) {
+            (16, [_, mode, operands @ ..]) => Some((*mode, operands)),
+            _ => None,
+        })
+        .collect())
+}
+
 // Inspect scalar/vector float interfaces from public types and decorations.
+// A geometry stage reads each input once per vertex of its primitive, so
+// its inputs are arrays of these.
 fn float_interface(words: &[u32], storage: u32) -> Result<Vec<(u32, u32)>, String> {
+    let per_vertex = storage == 1 && execution_model(words)? == GraphicsStage::Geometry.model();
     let instructions = instructions(words)?;
     let mut types = HashMap::new();
     let mut locations = HashMap::new();
@@ -864,6 +1532,11 @@ fn float_interface(words: &[u32], storage: u32) -> Result<Vec<(u32, u32)>, Strin
         if *actual != storage {
             return Err("interface storage mismatch".into());
         }
+        let ty = match types.get(ty) {
+            Some(&(28, [_, element, _])) if per_vertex => element,
+            _ if per_vertex => return Err("geometry inputs must be per-vertex arrays".into()),
+            _ => ty,
+        };
         if builtins.contains(&args[1]) || builtins.contains(ty) {
             if execution_model(words)? == 4 && storage == 3 {
                 return Err("fragment builtin output is unsupported".into());
@@ -908,6 +1581,8 @@ pub(crate) struct GraphicsPipeline {
     writes_banks: bool,
     modules: Vec<Arc<ShaderModule>>,
     push_set: Option<u32>,
+    /// The stages the layout's push-constant range names.
+    push_stages: vk::ShaderStageFlags,
     resource_owner: Option<Arc<GraphicsPipeline>>,
 }
 
@@ -922,25 +1597,24 @@ impl GraphicsPipeline {
         let fixed = matches!(part, Some(Part::Input | Part::Output));
         let mut banks = Vec::new();
         let mut textures = Vec::new();
-        if !fixed {
-            context.shader_features.validate_shader(&key.vertex)?;
-            context.shader_features.validate_shader(&key.fragment)?;
-            key.validate_interfaces()?;
-            banks = uniforms::banks(&key.vertex, UniformStage::Vertex)?;
-            banks.extend(uniforms::banks(&key.fragment, UniformStage::Fragment)?);
-            textures = super::textures::bindings(&key.vertex, UniformStage::Vertex)?;
-            textures.extend(super::textures::bindings(
-                &key.fragment,
-                UniformStage::Fragment,
-            )?);
-        }
-        let color_count = key.state.color_count.max(1);
         let limits = unsafe {
             context
                 .instance
                 .get_physical_device_properties(context.physical_device)
         }
         .limits;
+        if !fixed {
+            for (_, words) in key.stages.iter() {
+                context.shader_features.validate_shader(words)?;
+            }
+            key.validate_interfaces()?;
+            key.validate_geometry(&limits)?;
+            for (stage, words) in key.stages.iter() {
+                banks.extend(uniforms::banks(words, stage)?);
+                textures.extend(super::textures::bindings(words, stage)?);
+            }
+        }
+        let color_count = key.state.color_count.max(1);
         if color_count > limits.max_color_attachments {
             return Err("too many color attachments".into());
         }
@@ -969,7 +1643,11 @@ impl GraphicsPipeline {
                 .buffer_features
                 .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
             {
-                return Err("vertex format is unavailable".into());
+                return Err(format!(
+                    "vertex format {:?} (VkFormat {}) is unavailable",
+                    attribute.format,
+                    attribute.format.vk().as_raw()
+                ));
             }
         }
         let (per_stage, total, range) = if key.storage {
@@ -989,21 +1667,18 @@ impl GraphicsPipeline {
             && (u64::from(range) < BANK_SIZE
                 || limits.max_bound_descriptor_sets < 2
                 || banks.len() > total as usize
-                || [UniformStage::Vertex, UniformStage::Fragment]
-                    .iter()
-                    .any(|stage| {
-                        let count = banks.iter().filter(|b| b.stage == *stage).count();
-                        count > per_stage as usize
-                            || count > limits.max_per_stage_resources as usize
-                    }))
+                || GraphicsStage::ALL.iter().any(|stage| {
+                    let count = banks.iter().filter(|b| b.stage == *stage).count();
+                    count > per_stage as usize || count > limits.max_per_stage_resources as usize
+                }))
         {
             return Err("constant banks exceed device descriptor limits".into());
         }
         let of = |ty: vk::DescriptorType| textures.iter().filter(move |b| b.ty == ty);
         let features = context.shader_features;
         if of(vk::DescriptorType::STORAGE_IMAGE).any(|b| match b.stage {
-            UniformStage::Vertex => !features.vertex_pipeline_stores,
-            UniformStage::Fragment => !features.fragment_stores,
+            GraphicsStage::Vertex | GraphicsStage::Geometry => !features.vertex_pipeline_stores,
+            GraphicsStage::Fragment => !features.fragment_stores,
         }) {
             return Err("storage images in draw stages are unavailable".into());
         }
@@ -1012,36 +1687,35 @@ impl GraphicsPipeline {
             || of(vk::DescriptorType::SAMPLER).count() > limits.max_descriptor_set_samplers as usize
             || of(vk::DescriptorType::STORAGE_IMAGE).count()
                 > limits.max_descriptor_set_storage_images as usize
-            || [UniformStage::Vertex, UniformStage::Fragment]
-                .iter()
-                .any(|stage| {
-                    let count = |ty| of(ty).filter(|b| b.stage == *stage).count();
-                    let images = count(vk::DescriptorType::SAMPLED_IMAGE);
-                    let samplers = count(vk::DescriptorType::SAMPLER);
-                    let storage = count(vk::DescriptorType::STORAGE_IMAGE);
-                    let banks = banks.iter().filter(|b| b.stage == *stage).count();
-                    images > limits.max_per_stage_descriptor_sampled_images as usize
-                        || samplers > limits.max_per_stage_descriptor_samplers as usize
-                        || storage > limits.max_per_stage_descriptor_storage_images as usize
-                        || banks + images + samplers + storage
-                            > limits.max_per_stage_resources as usize
-                })
+            || GraphicsStage::ALL.iter().any(|stage| {
+                let count = |ty| of(ty).filter(|b| b.stage == *stage).count();
+                let images = count(vk::DescriptorType::SAMPLED_IMAGE);
+                let samplers = count(vk::DescriptorType::SAMPLER);
+                let storage = count(vk::DescriptorType::STORAGE_IMAGE);
+                let banks = banks.iter().filter(|b| b.stage == *stage).count();
+                images > limits.max_per_stage_descriptor_sampled_images as usize
+                    || samplers > limits.max_per_stage_descriptor_samplers as usize
+                    || storage > limits.max_per_stage_descriptor_storage_images as usize
+                    || banks + images + samplers + storage > limits.max_per_stage_resources as usize
+            })
         {
             return Err("texture descriptors exceed device limits".into());
         }
-        if key.state.colors[..color_count as usize]
-            .iter()
-            .any(|c| c.enable)
-            && !unsafe {
-                context.instance.get_physical_device_format_properties(
-                    context.physical_device,
-                    vk::Format::R8G8B8A8_UNORM,
-                )
-            }
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
-        {
-            return Err("color attachment blending is unavailable".into());
+        // An attachment needs blend support only when it blends. Source: the public contract.
+        for (format, color) in key.state.color_formats().zip(&key.state.colors) {
+            let usage = if color.enable {
+                super::formats::FormatUse::BlendedColorTarget
+            } else {
+                super::formats::FormatUse::ColorTarget
+            };
+            super::formats::supports(context, format, usage)?;
+        }
+        if key.state.attachment {
+            super::formats::supports(
+                context,
+                vk::Format::from_raw(key.state.depth_format),
+                super::formats::FormatUse::DepthTarget,
+            )?;
         }
         let features = unsafe {
             context
@@ -1072,41 +1746,42 @@ impl GraphicsPipeline {
             set_layouts: Vec::new(),
             modules: Vec::new(),
             push_set: None,
+            // Fixed-function parts run no stage; their layout keeps the
+            // vertex and fragment range it always had.
+            push_stages: if fixed {
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+            } else {
+                key.stages.flags()
+            },
             resource_owner: None,
-            writes_banks: key.storage
-                && (super::memory::storage_writes(&key.vertex)
-                    || super::memory::storage_writes(&key.fragment)),
-            global_writes: super::memory::physical_writes(&key.vertex)
-                || super::memory::physical_writes(&key.fragment),
-            batch_safe: fixed
-                || [&key.vertex, &key.fragment].iter().all(|words| {
-                    instructions(words).is_ok_and(|ops| {
-                        !ops.iter()
-                            .any(|&(op, args)| op == 32 && args.get(1) == Some(&5349))
-                    })
-                }),
+            writes_banks: key.writes_banks(),
+            global_writes: key.global_writes(),
+            batch_safe: fixed || key.batch_safe(),
             banks,
             textures,
             storage: key.storage,
         };
         // SAFETY: validated public Vulkan states, with owned partial handles.
         unsafe {
-            let mut attachments = vec![
-                vk::AttachmentDescription::default()
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::LOAD)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-                color_count as usize
-            ];
+            let mut attachments: Vec<_> = key
+                .state
+                .color_formats()
+                .map(|format| {
+                    vk::AttachmentDescription::default()
+                        .format(format)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .load_op(vk::AttachmentLoadOp::LOAD)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                })
+                .collect();
             if key.state.attachment {
                 attachments.push(
                     vk::AttachmentDescription::default()
-                        .format(vk::Format::D32_SFLOAT_S8_UINT)
+                        .format(vk::Format::from_raw(key.state.depth_format))
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .load_op(vk::AttachmentLoadOp::LOAD)
                         .store_op(vk::AttachmentStoreOp::STORE)
@@ -1143,36 +1818,48 @@ impl GraphicsPipeline {
                 )
                 .map_err(|e| format!("create draw render pass: {e:?}"))?;
             if !result.banks.is_empty() || !result.textures.is_empty() {
-                if limits.max_bound_descriptor_sets < 4 {
-                    return Err("four draw descriptor sets are unavailable".into());
+                // Each stage owns a bank set and a texture set; the stages
+                // present number them contiguously from zero.
+                let mut sets: Vec<(u32, GraphicsStage)> = key
+                    .stages
+                    .iter()
+                    .flat_map(|(stage, _)| {
+                        [(stage.bank_set(), stage), (stage.texture_set(), stage)]
+                    })
+                    .collect();
+                sets.sort_unstable_by_key(|&(set, _)| set);
+                if (limits.max_bound_descriptor_sets as usize) < sets.len() {
+                    return Err(format!(
+                        "{} draw descriptor sets are unavailable",
+                        sets.len()
+                    ));
                 }
                 if context.push_descriptors.is_some() {
-                    result.push_set = (0..4)
-                        .filter_map(|set| {
-                            let count =
-                                result.banks.iter().filter(|b| b.stage.set() == set).count()
-                                    + result
-                                        .textures
-                                        .iter()
-                                        .filter(|b| b.stage_set() == set)
-                                        .count();
+                    result.push_set = sets
+                        .iter()
+                        .filter_map(|&(set, _)| {
+                            let count = result
+                                .banks
+                                .iter()
+                                .filter(|b| b.stage.bank_set() == set)
+                                .count()
+                                + result
+                                    .textures
+                                    .iter()
+                                    .filter(|b| b.stage_set() == set)
+                                    .count();
                             (count != 0 && count <= context.max_push_descriptors.min(64) as usize)
                                 .then_some((set, count))
                         })
                         .max_by_key(|&(_, count)| count)
                         .map(|(set, _)| set);
                 }
-                for set in 0..4 {
-                    let stage = if set % 2 == 0 {
-                        UniformStage::Vertex
-                    } else {
-                        UniformStage::Fragment
-                    };
+                for &(set, stage) in &sets {
                     let bindings: Vec<_> =
                         result
                             .banks
                             .iter()
-                            .filter(|b| b.stage == stage && set < 2)
+                            .filter(|b| b.stage == stage && set == stage.bank_set())
                             .map(|b| {
                                 vk::DescriptorSetLayoutBinding::default()
                                     .binding(b.bank)
@@ -1212,9 +1899,10 @@ impl GraphicsPipeline {
                     );
                 }
             }
-            let ranges = [GlobalMemory::push_constant_range(
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            )];
+            // The global delta, then the window-to-clip scale (one range:
+            // Vulkan forbids two ranges sharing a stage).
+            let ranges = [GlobalMemory::push_constant_range(result.push_stages)
+                .size(PUSH_VIEWPORT_INVERSE_OFFSET + PUSH_VIEWPORT_INVERSE_SIZE)];
             result.layout = context
                 .device
                 .create_pipeline_layout(
@@ -1228,16 +1916,13 @@ impl GraphicsPipeline {
         #[cfg(feature = "draw-metrics")]
         drop(layout_span);
         let mut subgroup_sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-            .required_subgroup_size(32); 2];
+            .required_subgroup_size(32); 3];
         let mut stages = Vec::new();
-        for (index, ((words, stage, subset), subgroup_size)) in [
-            (&key.vertex, UniformStage::Vertex, Part::Raster),
-            (&key.fragment, UniformStage::Fragment, Part::Fragment),
-        ]
-        .into_iter()
-        .zip(subgroup_sizes.iter_mut())
-        .enumerate()
-        {
+        for ((stage, words), subgroup_size) in key.stages.iter().zip(subgroup_sizes.iter_mut()) {
+            let subset = match stage {
+                GraphicsStage::Vertex | GraphicsStage::Geometry => Part::Raster,
+                GraphicsStage::Fragment => Part::Fragment,
+            };
             if part.is_some_and(|p| p != subset) {
                 continue;
             }
@@ -1246,7 +1931,7 @@ impl GraphicsPipeline {
                 .stage(stage.flags())
                 .module(module.handle)
                 .name(c"main");
-            if key.state.subgroup_size_32[index] {
+            if key.state.subgroup_size_32[stage.slot()] {
                 context.shader_features.subgroups.validate(stage.flags())?;
                 info = info.push_next(subgroup_size);
             }
@@ -1364,13 +2049,12 @@ impl GraphicsPipeline {
     pub(super) fn link(key: &Key, parts: &[Arc<Self>]) -> Result<Self, String> {
         #[cfg(feature = "draw-metrics")]
         let _span = crate::draw_metrics::PipelineSpan::new(7);
-        let mut banks = uniforms::banks(&key.vertex, UniformStage::Vertex)?;
-        banks.extend(uniforms::banks(&key.fragment, UniformStage::Fragment)?);
-        let mut textures = super::textures::bindings(&key.vertex, UniformStage::Vertex)?;
-        textures.extend(super::textures::bindings(
-            &key.fragment,
-            UniformStage::Fragment,
-        )?);
+        let mut banks = Vec::new();
+        let mut textures = Vec::new();
+        for (stage, words) in key.stages.iter() {
+            banks.extend(uniforms::banks(words, stage)?);
+            textures.extend(super::textures::bindings(words, stage)?);
+        }
         let owner = &parts[1];
         let handles: Vec<_> = parts.iter().map(|p| p.pipeline).collect();
         let mut libraries = vk::PipelineLibraryCreateInfoKHR::default().libraries(&handles);
@@ -1405,19 +2089,12 @@ impl GraphicsPipeline {
             banks,
             textures,
             storage: key.storage,
-            writes_banks: key.storage
-                && (super::memory::storage_writes(&key.vertex)
-                    || super::memory::storage_writes(&key.fragment)),
-            global_writes: super::memory::physical_writes(&key.vertex)
-                || super::memory::physical_writes(&key.fragment),
-            batch_safe: [&key.vertex, &key.fragment].iter().all(|words| {
-                instructions(words).is_ok_and(|ops| {
-                    !ops.iter()
-                        .any(|&(op, args)| op == 32 && args.get(1) == Some(&5349))
-                })
-            }),
+            writes_banks: key.writes_banks(),
+            global_writes: key.global_writes(),
+            batch_safe: key.batch_safe(),
             modules: Vec::new(),
             push_set: owner.push_set,
+            push_stages: owner.push_stages,
             resource_owner: Some(owner.clone()),
         })
     }
@@ -1512,16 +2189,24 @@ impl GraphicsPipeline {
             }
             #[cfg(feature = "draw-metrics")]
             crate::draw_metrics::count(1);
-            result.pool = self
-                .context
-                .device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(4)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .map_err(|e| format!("create draw descriptor pool: {e:?}"))?;
+            // One set per layout the pool allocates: each stage's bank and
+            // texture sets, less the pushed one. A pool with no set to
+            // allocate is not made.
+            let allocated = (0..self.set_layouts.len() as u32)
+                .filter(|&set| self.push_set != Some(set))
+                .count() as u32;
+            if allocated != 0 {
+                result.pool = self
+                    .context
+                    .device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(allocated)
+                            .pool_sizes(&sizes),
+                        None,
+                    )
+                    .map_err(|e| format!("create draw descriptor pool: {e:?}"))?;
+            }
             result.sets = vec![vk::DescriptorSet::null(); self.set_layouts.len()];
             for (set, &layout) in self.set_layouts.iter().enumerate() {
                 if self.push_set == Some(set as u32) {
@@ -1543,7 +2228,7 @@ impl GraphicsPipeline {
                 .zip(buffers)
                 .map(|(bank, buffer)| {
                     vk::WriteDescriptorSet::default()
-                        .dst_set(result.sets[bank.stage.set() as usize])
+                        .dst_set(result.sets[bank.stage.bank_set() as usize])
                         .dst_binding(bank.bank)
                         .descriptor_type(self.descriptor_type())
                         .buffer_info(std::slice::from_ref(buffer))
@@ -1609,7 +2294,7 @@ impl GraphicsPipeline {
             let mut writes = [vk::WriteDescriptorSet::default(); 64];
             let mut count = 0;
             for (bank, buffer) in self.banks.iter().zip(&draw.descriptors.buffers) {
-                if bank.stage.set() == set {
+                if bank.stage.bank_set() == set {
                     writes[count] = vk::WriteDescriptorSet::default()
                         .dst_binding(bank.bank)
                         .descriptor_type(self.descriptor_type())
@@ -1640,10 +2325,13 @@ impl GraphicsPipeline {
         }
         device.cmd_set_viewport(command, 0, &[draw.viewport]);
         device.cmd_set_scissor(command, 0, &[draw.scissor]);
-        memory.push_delta(
+        memory.push_delta(command, self.layout, self.push_stages);
+        super::recording_device::RecordingDevice::new(device).cmd_push_constants(
             command,
             self.layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            self.push_stages,
+            PUSH_VIEWPORT_INVERSE_OFFSET,
+            &viewport_inverse(&draw.viewport),
         );
     }
 
@@ -1731,7 +2419,7 @@ struct DescriptorKey {
 }
 #[derive(Default)]
 struct DescriptorCache {
-    ids: HashMap<DescriptorKey, usize>,
+    ids: crate::keymap::KeyMap<DescriptorKey, usize>,
     entries: Vec<Arc<DrawDescriptors>>,
 }
 pub(crate) struct PendingDraw {
@@ -1756,6 +2444,28 @@ impl Drop for DrawDescriptors {
             self.context.device.destroy_descriptor_pool(self.pool, None);
         }
     }
+}
+
+/// Push-constant offset of the window-to-clip scale a program translated
+/// with a disabled viewport transform reads (the shader translator
+/// PUSH_VIEWPORT_INVERSE_OFFSET). Pushed for every draw; programs that do
+/// not declare it ignore it.
+pub const PUSH_VIEWPORT_INVERSE_OFFSET: u32 = 8;
+/// Size of that scale: two binary32 values (the shader translator
+/// PUSH_VIEWPORT_INVERSE_SIZE).
+pub const PUSH_VIEWPORT_INVERSE_SIZE: u32 = 8;
+
+/// The draw's window-to-clip scale, `render_scale * 2 / extent` per axis, as
+/// the reference host Gpu/Memory/SupportBufferUpdater.cs:157-170 computes it from the
+/// viewport region (Gpu/Engine/Threed/StateUpdater.cs:744-753,807-811).
+/// SwXBx renders at render scale 1. A mirrored viewport keeps its extent.
+fn viewport_inverse(viewport: &vk::Viewport) -> [u8; 8] {
+    let x = 2.0 / viewport.width.abs();
+    let y = 2.0 / viewport.height.abs();
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&x.to_ne_bytes());
+    bytes[4..].copy_from_slice(&y.to_ne_bytes());
+    bytes
 }
 
 #[cfg(test)]

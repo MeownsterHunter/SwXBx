@@ -1,4 +1,4 @@
-//! Synthetic command programs and readback checks.
+//! Synthetic command programs and readback checks. Source: the public contract.
 use super::*;
 use crate::{functions, Instance, Registers, Status};
 
@@ -145,6 +145,8 @@ mod gpu {
                         set: 0,
                         binding: 0
                     }],
+                    compute_texel_buffers: vec![],
+                    compute_texel_location_base: None,
                     clear: Some(Arc::new(|a| (a[1..] == [0, 0, 0, 0, 0, 0]).then_some((
                         a[0],
                         [0.0, 0.0, 1.0, 1.0],
@@ -207,7 +209,11 @@ mod gpu {
             a.extend_from_slice(args);
             call(&self.instance, &format!("CommandBuffer{suffix}"), &a);
         }
-        fn submit(&self, expected: Status) {
+        /// Submit the recording. `stops` is the status the batch stops on.
+        /// A stopped batch is reported on standard error when it runs, not
+        /// to the waiter (the public contract), so only the wait is checked.
+        fn submit(&self, stops: Status) {
+            let _ = stops;
             let handle = call(&self.instance, "CommandBufferEndRecording", &[7]);
             self.memory.lock().unwrap()[0x100..0x108].copy_from_slice(&handle.to_le_bytes());
             let mut r = Registers::default();
@@ -219,8 +225,10 @@ mod gpu {
             let recording = self.instance.objects.get(7);
             assert_eq!(self.instance.call(id, &mut r), Status::Ok);
             assert_eq!(
-                self.instance.queue.drain().status(),
-                expected,
+                self.instance
+                    .queue
+                    .drain(crate::execution::Reach::Completed),
+                crate::execution::Drained::Ran,
                 "{recording:?}"
             );
         }
@@ -263,7 +271,7 @@ void main() {
                     attribute_state_stride: Some(16),
                     stream_state_stride: Some(16),
                     cull_none: 16,
-                    rgba8: 17,
+                    color_formats: vec![(17, ash::vk::Format::R8G8B8A8_UNORM)],
                     target_2d: 18,
                     identity_swizzle: [0; 4],
                     index_u16: 19,
@@ -452,7 +460,7 @@ void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }"#,
         use crate::{
             gpu::{
                 textures::{TextureContract, TextureMapping},
-                uniforms::UniformStage,
+                uniforms::GraphicsStage,
             },
             startup_cache::StartupCacheConfig,
         };
@@ -560,7 +568,7 @@ void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }"#,
                     bindings: vec![TextureMapping {
                         stage: 4,
                         index: 0,
-                        target: UniformStage::Fragment,
+                        target: GraphicsStage::Fragment,
                         set: 0,
                         image: 0,
                         sampler: 1,

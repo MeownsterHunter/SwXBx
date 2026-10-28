@@ -1,4 +1,4 @@
-//! Render images and transfers to canonical arena bytes.
+//! Render images and transfers to canonical arena bytes. Source: the public contract. and 0028; 0032.
 
 use super::image_layout::format_aspects;
 use super::recording_device::RecordingDevice as Device;
@@ -32,8 +32,16 @@ pub(super) struct Image {
     memory: vk::DeviceMemory,
     /// Image handle and tracked transfer metadata.
     pub info: ImageInfo,
-    views: HashMap<[i32; 4], vk::ImageView>,
+    views: HashMap<ViewKey, vk::ImageView>,
     packing: Option<Layout>,
+}
+
+/// The views an image keeps: whole-resource sampled views by component
+/// mapping, and the one view a draw renders into.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum ViewKey {
+    Sampled([i32; 4]),
+    Attachment,
 }
 
 impl Image {
@@ -58,13 +66,11 @@ impl Image {
                 format,
             },
         )?;
-        image.info.size = u64::from(width)
-            * u64::from(height)
-            * if format == vk::Format::D32_SFLOAT_S8_UINT {
-                5
-            } else {
-                4
-            };
+        let texels = u64::from(width) * u64::from(height);
+        image.info.size = super::formats::depth_planes(format).map_or_else(
+            || texels * super::image_layout::format_block(format).map_or(4, |b| u64::from(b.bytes)),
+            |planes| planes.size(texels),
+        );
         image.packing = None;
         Some(image)
     }
@@ -73,7 +79,7 @@ impl Image {
     pub fn with_descriptor(context: &Arc<Context>, descriptor: &ImageDescriptor) -> Option<Self> {
         let shape = descriptor.shape;
         let format = descriptor.format;
-        let packing = if format == vk::Format::D32_SFLOAT_S8_UINT {
+        let packing = if super::formats::depth_planes(format).is_some_and(|p| p.stencil != 0) {
             if shape.depth != 1 || shape.layers != 1 || shape.levels != 1 {
                 return None;
             }
@@ -94,15 +100,23 @@ impl Image {
             ImageKind::D3 => vk::ImageType::TYPE_3D,
             _ => vk::ImageType::TYPE_2D,
         };
-        let flags = if shape.kind == ImageKind::Cube {
-            vk::ImageCreateFlags::CUBE_COMPATIBLE
-        } else {
-            vk::ImageCreateFlags::empty()
-        };
         let props = unsafe {
             context
                 .instance
                 .get_physical_device_format_properties(context.physical_device, format)
+        };
+        // A 3D image a draw renders into is viewed as an array of its depth
+        // slices (the reference host Graphics.Vulkan TextureStorage.cs).
+        let flags = match shape.kind {
+            ImageKind::Cube => vk::ImageCreateFlags::CUBE_COMPATIBLE,
+            ImageKind::D3
+                if props
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT) =>
+            {
+                vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE
+            }
+            _ => vk::ImageCreateFlags::empty(),
         };
         let mut usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if !props
@@ -171,11 +185,12 @@ impl Image {
         {
             return None;
         }
-        let size = packing
-            .as_ref()
-            .map_or(u64::from(shape.width) * u64::from(shape.height) * 5, |p| {
-                p.linear_size() as u64
-            });
+        let texels = u64::from(shape.width) * u64::from(shape.height);
+        let size = match (&packing, super::formats::depth_planes(format)) {
+            (Some(p), _) => p.linear_size() as u64,
+            (None, Some(planes)) => planes.size(texels),
+            (None, None) => texels * 5,
+        };
         let image = unsafe {
             context
                 .device
@@ -245,12 +260,12 @@ impl Image {
         &mut self,
         components: vk::ComponentMapping,
     ) -> Option<vk::ImageView> {
-        let key = [
+        let key = ViewKey::Sampled([
             components.r.as_raw(),
             components.g.as_raw(),
             components.b.as_raw(),
             components.a.as_raw(),
-        ];
+        ]);
         if let Some(view) = self.views.get(&key) {
             return Some(*view);
         }
@@ -279,6 +294,43 @@ impl Image {
                 .ok()?
         };
         self.views.insert(key, view);
+        Some(view)
+    }
+
+    /// The layers a draw renders into: a 3D image's depth slices, else one.
+    pub fn attachment_layers(&self) -> u32 {
+        match self.info.shape.kind {
+            ImageKind::D3 => self.info.shape.depth,
+            _ => 1,
+        }
+    }
+
+    /// Create or reuse the view a draw renders into. A 3D image is drawn
+    /// as a 2D array over its depth slices; every other image through its
+    /// whole-resource view.
+    pub fn attachment_view(&mut self) -> Option<vk::ImageView> {
+        if self.info.shape.kind != ImageKind::D3 {
+            return self.view();
+        }
+        if let Some(view) = self.views.get(&ViewKey::Attachment) {
+            return Some(*view);
+        }
+        let view = unsafe {
+            self.context
+                .device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(self.info.image)
+                        .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                        .format(self.info.format)
+                        .subresource_range(
+                            range(self.info.format).layer_count(self.info.shape.depth),
+                        ),
+                    None,
+                )
+                .ok()?
+        };
+        self.views.insert(ViewKey::Attachment, view);
         Some(view)
     }
 
@@ -444,13 +496,15 @@ struct DrawResources {
 pub(super) struct Images {
     context: Arc<Context>,
     commands: Commands,
-    images: HashMap<u64, Image>,
+    images: crate::keymap::KeyMap<u64, Image>,
     recycled: Vec<Image>,
     staging: Option<Buffer>,
     transfer: Option<Transfer>,
     framebuffer: Option<Arc<DrawFramebuffer>>,
     draw_resources: Vec<DrawResources>,
     parallel_recording: bool,
+    /// The UNORM copy a present or readback of an sRGB texture blits from.
+    byte_alias: Option<Image>,
 }
 
 impl Drop for Images {
@@ -467,12 +521,13 @@ impl Images {
         Some(Self {
             context: Arc::clone(context),
             commands: Commands::with_capacity(context, RETAINED_SLOTS)?,
-            images: HashMap::new(),
+            images: Default::default(),
             recycled: Vec::new(),
             staging: None,
             transfer: None,
             framebuffer: None,
             parallel_recording: false,
+            byte_alias: None,
             draw_resources: (0..RETAINED_SLOTS)
                 .map(|_| DrawResources::default())
                 .collect(),
@@ -843,6 +898,24 @@ impl Images {
         Some(self.images.get(&key)?.info.format)
     }
 
+    /// Whether a region names the complete, single-level image.
+    pub fn complete_region(&self, key: u64, region: super::image_layout::ImageRegion) -> bool {
+        let Some(image) = self.images.get(&key) else {
+            return false;
+        };
+        region.level == 0
+            && region.layer == 0
+            && region.offset == [0, 0, 0]
+            && image.info.shape.levels == 1
+            && image.info.shape.layers == 1
+            && region.extent
+                == [
+                    image.info.extent.width,
+                    image.info.extent.height,
+                    image.info.extent.depth,
+                ]
+    }
+
     /// Transition the image for shader reads and return its whole-resource view.
     pub fn sampled(&mut self, key: u64) -> Option<vk::ImageView> {
         self.sampled_with_components(key, vk::ComponentMapping::default())
@@ -885,9 +958,8 @@ impl Images {
         if mask & 15 == 0 {
             return Some(());
         }
-        if self.images.get(&key)?.info.format != vk::Format::R8G8B8A8_UNORM {
-            return None;
-        }
+        let value =
+            super::formats::color_clear(self.images.get(&key)?.info.format, color, mask).ok()?;
         if mask & 15 != 15 {
             // Vulkan transfer clears cannot mask channels. Preserve the others.
             let (_, _, mut bytes) = self.readback(key)?;
@@ -913,7 +985,7 @@ impl Images {
                 cmd,
                 image.info.image,
                 image.info.layout,
-                &vk::ClearColorValue { float32: color },
+                &value,
                 &[image_range(image.info)],
             );
         }
@@ -934,11 +1006,13 @@ impl Images {
         let pipeline = &draws.first()?.pipeline;
         let extent = self.images.get(keys.first()?)?.info.extent;
         let mut views = [vk::ImageView::null(); 9];
-        for (at, key) in keys.iter().enumerate() {
-            views[at] = self.images.get_mut(key)?.view()?;
-        }
-        if let Some(depth) = depth {
-            views[keys.len()] = self.images.get_mut(&depth)?.view()?;
+        // Every attachment holds each framebuffer layer (the reference host
+        // Graphics.Vulkan FramebufferParams.cs takes the least).
+        let mut layers = u32::MAX;
+        for (at, key) in keys.iter().chain(depth.as_ref()).enumerate() {
+            let image = self.images.get_mut(key)?;
+            layers = layers.min(image.attachment_layers());
+            views[at] = image.attachment_view()?;
         }
         let views = &views[..keys.len() + usize::from(depth.is_some())];
         if self
@@ -955,7 +1029,7 @@ impl Images {
                             .attachments(views)
                             .width(extent.width)
                             .height(extent.height)
-                            .layers(1),
+                            .layers(layers),
                         None,
                     )
                     .ok()?
@@ -1052,10 +1126,27 @@ impl Images {
         result
     }
 
-    /// Clear a depth image and complete the transfer.
-    pub fn clear_depth(&mut self, key: u64, depth: f32) -> Option<()> {
-        if self.images.get(&key)?.info.format != vk::Format::D32_SFLOAT {
-            return None;
+    /// Clear the depth and, when `stencil` is given, the stencil of a depth
+    /// image and complete the transfer. Source: the public contract.
+    pub fn clear_depth(
+        &mut self,
+        key: u64,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Option<()> {
+        let planes = super::formats::depth_planes(self.images.get(&key)?.info.format)?;
+        let mut aspects = vk::ImageAspectFlags::empty();
+        if depth.is_some() {
+            aspects |= vk::ImageAspectFlags::DEPTH;
+        }
+        if stencil.is_some() {
+            if planes.stencil == 0 {
+                return None;
+            }
+            aspects |= vk::ImageAspectFlags::STENCIL;
+        }
+        if aspects.is_empty() {
+            return Some(());
         }
         let (cmd, _) = if self.parallel_recording {
             self.commands.begin()?
@@ -1069,8 +1160,11 @@ impl Images {
                 cmd,
                 image.info.image,
                 image.info.layout,
-                &vk::ClearDepthStencilValue { depth, stencil: 0 },
-                &[image_range(image.info)],
+                &vk::ClearDepthStencilValue {
+                    depth: depth.unwrap_or(0.0),
+                    stencil: stencil.unwrap_or(0),
+                },
+                &[image_range(image.info).aspect_mask(aspects)],
             );
         }
         self.commands.submit(false, None)
@@ -1078,18 +1172,6 @@ impl Images {
 
     pub fn info(&self, key: u64) -> Option<ImageInfo> {
         self.images.get(&key).map(|image| image.info)
-    }
-
-    /// Let a readback command own the source transition and update its tracked layout.
-    pub fn readback_source(
-        &mut self,
-        key: u64,
-        record: impl FnOnce(ImageInfo) -> Option<()>,
-    ) -> Option<()> {
-        let image = self.images.get_mut(&key)?;
-        record(image.info)?;
-        image.info.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-        Some(())
     }
 
     /// Make an image transfer-readable and return its tracked metadata.
@@ -1100,6 +1182,83 @@ impl Images {
         let info = image.info;
         self.commands.submit(false, None)?;
         Some(info)
+    }
+
+    /// Make the image a present or readback blits from, transfer-readable,
+    /// and return it. The texture must be a color format of one texel per
+    /// block that reads as float. An sRGB texture is first copied, byte for
+    /// byte, into an image of the UNORM format with the same bytes, so the
+    /// blit carries the stored bytes unchanged instead of decoding them.
+    /// Source: the public contract.
+    pub fn shown_source(&mut self, key: u64) -> Result<ImageInfo, (crate::Status, String)> {
+        let failed = || {
+            (
+                crate::Status::InternalError,
+                "the device step that makes it readable failed".to_string(),
+            )
+        };
+        let unsupported = |why: String| (crate::Status::Unimplemented, why);
+        let info = self
+            .images
+            .get(&key)
+            .ok_or_else(|| {
+                (
+                    crate::Status::BadArgument,
+                    "it has no device image".to_string(),
+                )
+            })?
+            .info;
+        super::formats::shown(info.format).map_err(unsupported)?;
+        let Some(unorm) = super::formats::byte_alias(info.format) else {
+            return self.source(key).ok_or_else(failed);
+        };
+        let extent = vk::Extent3D {
+            width: info.extent.width,
+            height: info.extent.height,
+            depth: 1,
+        };
+        if !self
+            .byte_alias
+            .as_ref()
+            .is_some_and(|alias| alias.info.format == unorm && alias.info.extent == extent)
+        {
+            self.byte_alias = Some(
+                Image::new(&self.context, extent.width, extent.height, unorm).ok_or_else(|| {
+                    unsupported(format!(
+                        "the device cannot hold the bytes of {} as {}, which swxbx shows them \
+                         as",
+                        super::formats::Name(info.format),
+                        super::formats::Name(unorm)
+                    ))
+                })?,
+            );
+        }
+        let (cmd, _) = self.commands.begin_direct().ok_or_else(failed)?;
+        let (image, alias) = (
+            self.images.get_mut(&key).ok_or_else(failed)?,
+            self.byte_alias.as_mut().ok_or_else(failed)?,
+        );
+        image.transition(cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        alias.transition(cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        // SAFETY: both images are live, in the layouts just recorded, and the
+        // region is the base level both share.
+        unsafe {
+            self.context.recorder().cmd_copy_image(
+                cmd,
+                image.info.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                alias.info.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(layers(info.format))
+                    .dst_subresource(layers(unorm))
+                    .extent(extent)],
+            );
+        }
+        alias.transition(cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let shown = alias.info;
+        self.commands.submit(false, None).ok_or_else(failed)?;
+        Ok(shown)
     }
 
     /// Copy packed-linear bytes between a checked arena buffer range and an image.
@@ -1220,7 +1379,26 @@ impl Images {
         self.commands.submit(false, None)
     }
 
-    /// Copy checked compatible image regions and complete the transfer.
+    /// Why a copy between two existing images cannot be made as asked, or
+    /// None when it can.
+    pub fn copy_fault(
+        &self,
+        destination: u64,
+        source: u64,
+        from: super::image_layout::ImageRegion,
+        to: super::image_layout::ImageRegion,
+    ) -> Option<String> {
+        regions_fault(destination, source, from, to).or_else(|| {
+            let (Some(src), Some(dst)) = (self.images.get(&source), self.images.get(&destination))
+            else {
+                return Some("a texture of the copy has no image".into());
+            };
+            footprint_fault(src.info.into(), dst.info.into(), from, to)
+        })
+    }
+
+    /// Copy image regions [`Self::copy_fault`] accepted and complete the
+    /// transfer. None is a device failure.
     pub fn copy_region(
         &mut self,
         destination: u64,
@@ -1228,14 +1406,8 @@ impl Images {
         from: super::image_layout::ImageRegion,
         to: super::image_layout::ImageRegion,
     ) -> Option<()> {
-        if source == destination || from.extent != to.extent {
-            return None;
-        }
         let src = self.images.get(&source)?.info;
         let dst = self.images.get(&destination)?.info;
-        if src.format != dst.format || !valid_region(src, from) || !valid_region(dst, to) {
-            return None;
-        }
         let offsets = |v: [u32; 3]| vk::Offset3D {
             x: v[0] as i32,
             y: v[1] as i32,
@@ -1395,6 +1567,7 @@ impl Images {
             cmd,
             source,
             target.info,
+            Placement::Whole,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
         target.info.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
@@ -1469,12 +1642,15 @@ fn buffer_regions(
         .buffer_offset(offset)
         .image_subresource(layers(info.format))
         .image_extent(info.extent);
-    if info.format == vk::Format::D32_SFLOAT_S8_UINT {
+    if let Some(planes) = super::formats::depth_planes(info.format).filter(|p| p.stencil != 0) {
         vec![
             depth,
             vk::BufferImageCopy::default()
                 .buffer_offset(
-                    offset + u64::from(info.extent.width) * u64::from(info.extent.height) * 4,
+                    offset
+                        + planes.stencil_offset(
+                            u64::from(info.extent.width) * u64::from(info.extent.height),
+                        ),
                 )
                 .image_subresource(
                     vk::ImageSubresourceLayers::default()
@@ -1599,12 +1775,47 @@ pub(super) fn can_blit(context: &Context, source: vk::Format, destination: vk::F
     }
 }
 
+/// Where a presented image lands in its destination. Source: the public contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The whole destination.
+    Whole,
+    /// This rectangle, `[x0, y0]` to `[x1, y1]`; the rest of the destination is black.
+    Inset { start: [i32; 2], end: [i32; 2] },
+}
+
+impl Placement {
+    /// The rectangle a scaling gives in a destination of `extent`. Fit keeps
+    /// the aspect, centred, as the reference host's Vulkan window does (the reference host, MIT:
+    /// src/the reference host.Graphics.Vulkan/Window.cs, Present: ratioX, ratioY,
+    /// dstWidth, dstHeight, dstPaddingX, dstPaddingY), without its flips.
+    pub(crate) fn of(scaling: crate::Scaling, extent: vk::Extent3D) -> Self {
+        let crate::Scaling::Fit(aspect) = scaling else {
+            return Self::Whole;
+        };
+        let (width, height) = (extent.width as i32, extent.height as i32);
+        let (w, h) = (width as f32, height as f32);
+        let ratio_x = f32::min(1.0, h * aspect.width() / (w * aspect.height()));
+        let ratio_y = f32::min(1.0, w * aspect.height() / (h * aspect.width()));
+        let padding_x = (width - (w * ratio_x) as i32) / 2;
+        let padding_y = (height - (h * ratio_y) as i32) / 2;
+        if padding_x == 0 && padding_y == 0 {
+            return Self::Whole;
+        }
+        Self::Inset {
+            start: [padding_x, padding_y],
+            end: [width - padding_x, height - padding_y],
+        }
+    }
+}
+
 /// Shared by swapchain and offscreen presentation, including conversion and scaling.
 pub(super) fn record_present(
     device: &Device<'_>,
     cmd: vk::CommandBuffer,
     source: ImageInfo,
     destination: ImageInfo,
+    placement: Placement,
     final_layout: vk::ImageLayout,
 ) {
     transition(device, cmd, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -1624,6 +1835,40 @@ pub(super) fn record_present(
             },
         ]
     };
+    let target = match placement {
+        Placement::Whole => offsets(destination.extent),
+        Placement::Inset { start, end } => {
+            let target = ImageInfo {
+                layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                ..destination
+            };
+            unsafe {
+                device.cmd_clear_color_image(
+                    cmd,
+                    destination.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                    &[image_range(target)],
+                );
+            }
+            // The blit writes over part of what the clear wrote.
+            transition(device, cmd, target, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            [
+                vk::Offset3D {
+                    x: start[0],
+                    y: start[1],
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: end[0],
+                    y: end[1],
+                    z: 1,
+                },
+            ]
+        }
+    };
     unsafe {
         device.cmd_blit_image(
             cmd,
@@ -1635,7 +1880,7 @@ pub(super) fn record_present(
                 .src_subresource(layers(source.format))
                 .src_offsets(offsets(source.extent))
                 .dst_subresource(layers(destination.format))
-                .dst_offsets(offsets(destination.extent))],
+                .dst_offsets(target)],
             vk::Filter::NEAREST,
         );
     }
@@ -1650,37 +1895,123 @@ pub(super) fn record_present(
     );
 }
 
-fn mip_extent(info: ImageInfo, level: u32) -> Option<[u32; 3]> {
-    if level >= info.shape.levels {
+/// What a copy needs to know of one image: its format, base extent and
+/// subresources.
+#[derive(Clone, Copy)]
+pub(crate) struct Footprint {
+    format: vk::Format,
+    extent: [u32; 3],
+    layers: u32,
+    levels: u32,
+}
+impl Footprint {
+    /// The image a descriptor creates.
+    pub(crate) fn of(descriptor: &ImageDescriptor) -> Self {
+        let shape = descriptor.shape;
+        Self {
+            format: descriptor.format,
+            extent: [shape.width, shape.height, shape.depth],
+            layers: shape.layers,
+            levels: shape.levels,
+        }
+    }
+}
+impl From<ImageInfo> for Footprint {
+    fn from(info: ImageInfo) -> Self {
+        Self {
+            format: info.format,
+            extent: [info.extent.width, info.extent.height, info.extent.depth],
+            layers: info.shape.layers,
+            levels: info.shape.levels,
+        }
+    }
+}
+fn mip_extent(image: Footprint, level: u32) -> Option<[u32; 3]> {
+    if level >= image.levels {
         return None;
     }
-    Some([
-        (info.extent.width >> level).max(1),
-        (info.extent.height >> level).max(1),
-        (info.extent.depth >> level).max(1),
-    ])
+    Some(image.extent.map(|n| (n >> level).max(1)))
 }
-fn valid_region(info: ImageInfo, r: super::image_layout::ImageRegion) -> bool {
-    let Some(extent) = mip_extent(info, r.level) else {
-        return false;
-    };
-    if r.layer >= info.shape.layers {
-        return false;
+/// Why a copy cannot be made from its texture keys and regions alone, or
+/// None when it can be as far as they tell.
+pub(crate) fn regions_fault(
+    destination: u64,
+    source: u64,
+    from: super::image_layout::ImageRegion,
+    to: super::image_layout::ImageRegion,
+) -> Option<String> {
+    if source == destination {
+        return Some("source and destination are the same texture".into());
     }
-    let Some(block) = super::image_layout::format_block(info.format) else {
-        return false;
+    (from.extent != to.extent).then(|| {
+        format!(
+            "source extent {:?} differs from destination extent {:?}",
+            from.extent, to.extent
+        )
+    })
+}
+/// Why a copy between two images of these footprints cannot be made as
+/// asked, or None when it can.
+pub(crate) fn footprint_fault(
+    src: Footprint,
+    dst: Footprint,
+    from: super::image_layout::ImageRegion,
+    to: super::image_layout::ImageRegion,
+) -> Option<String> {
+    if !copy_format_compatible(src.format, dst.format) {
+        return Some(format!(
+            "source VkFormat {} differs from destination VkFormat {}",
+            src.format.as_raw(),
+            dst.format.as_raw()
+        ));
+    }
+    region_fault(src, from)
+        .map(|fault| format!("source region: {fault}"))
+        .or_else(|| region_fault(dst, to).map(|fault| format!("destination region: {fault}")))
+}
+
+fn copy_format_compatible(source: vk::Format, destination: vk::Format) -> bool {
+    source == destination
+        || super::formats::byte_alias(source) == Some(destination)
+        || super::formats::byte_alias(destination) == Some(source)
+}
+/// Why a copy region does not lie inside one image, or None when it does.
+fn region_fault(image: Footprint, r: super::image_layout::ImageRegion) -> Option<String> {
+    let Some(extent) = mip_extent(image, r.level) else {
+        return Some(format!(
+            "level {} is outside the image's {} levels",
+            r.level, image.levels
+        ));
+    };
+    if r.layer >= image.layers {
+        return Some(format!(
+            "layer {} is outside the image's {} layers",
+            r.layer, image.layers
+        ));
+    }
+    let Some(block) = super::image_layout::format_block(image.format) else {
+        return Some(format!(
+            "VkFormat {} has no texel block size",
+            image.format.as_raw()
+        ));
     };
     let align = [u32::from(block.width), u32::from(block.height), 1];
-    (0..3).all(|i| {
+    let fits = (0..3).all(|i| {
         r.extent[i] > 0
             && r.offset[i].is_multiple_of(align[i])
             && r.offset[i].checked_add(r.extent[i]).is_some_and(|end| {
                 end <= extent[i] && (r.extent[i].is_multiple_of(align[i]) || end == extent[i])
             })
+    });
+    (!fits).then(|| {
+        format!(
+            "{:?} at {:?} does not fit level {} ({:?}) in {}x{} texel blocks",
+            r.extent, r.offset, r.level, extent, align[0], align[1]
+        )
     })
 }
 fn valid_blit(info: ImageInfo, r: super::image_layout::BlitRegion) -> bool {
-    let Some(extent) = mip_extent(info, r.level) else {
+    let Some(extent) = mip_extent(info.into(), r.level) else {
         return false;
     };
     r.layer < info.shape.layers
@@ -1695,6 +2026,22 @@ fn valid_blit(info: ImageInfo, r: super::image_layout::BlitRegion) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_accepts_srgb_and_unorm_byte_aliases_only() {
+        assert!(copy_format_compatible(
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::R8G8B8A8_UNORM
+        ));
+        assert!(copy_format_compatible(
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB
+        ));
+        assert!(!copy_format_compatible(
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::R8G8B8A8_UNORM
+        ));
+    }
 
     #[test]
     #[ignore = "requires a Vulkan device with unrestricted floating depth"]

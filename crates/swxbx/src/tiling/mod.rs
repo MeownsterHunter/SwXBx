@@ -1,5 +1,5 @@
 //! CPU conversion between packed-linear image bytes and a block-linear layout.
-//!
+//! Source: the public contract.
 
 use std::{error::Error, fmt, thread};
 

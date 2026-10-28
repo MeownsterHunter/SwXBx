@@ -1,4 +1,4 @@
-//! Bounded command reuse with timeline completion values.
+//! Bounded command reuse with timeline completion values. Source: the public contract.
 
 use super::Context;
 use ash::vk;

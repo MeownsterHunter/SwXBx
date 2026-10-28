@@ -1,4 +1,4 @@
-/* swxbx host interface, version 5. See docs/host-interface.md. */
+/* swxbx host interface, version 6. See docs/host-contract.md. */
 #ifndef SWXBX_H
 #define SWXBX_H
 
@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define SWXBX_HOST_INTERFACE_VERSION 5u
+#define SWXBX_HOST_INTERFACE_VERSION 6u
 
 /* Returned by lookups for a name the library does not know. */
 #define SWXBX_FUNCTION_NONE UINT32_MAX
@@ -27,13 +27,34 @@ typedef enum swxbx_status {
     SWXBX_INTERNAL_ERROR = 4
 } swxbx_status;
 
-/* Optional native presentation contract, introduced in version 5.
+/* How a presented image fills the window's drawable (version 6).
+ * SWXBX_SCALING_STRETCH fills it. SWXBX_SCALING_FIT keeps the ratio
+ * aspect_width : aspect_height (both positive and finite), centred, with black
+ * bars on the remaining sides; the aspect fields are read only for a fit. */
+#define SWXBX_SCALING_STRETCH 0u
+#define SWXBX_SCALING_FIT 1u
+typedef struct swxbx_scaling {
+    uint32_t kind;
+    float aspect_width;
+    float aspect_height;
+} swxbx_scaling;
+
+/* Optional native presentation contract, introduced in version 5; scaling
+ * was added in version 6.
  * The extension names remain valid until instance creation returns.
  * create_surface returns a VkSurfaceKHR as uint64_t, or 0 on failure.
  * swxbx owns and destroys that surface. The native window stays live until
  * WindowFinalize or instance destruction. The struct and callbacks stay live
- * until instance destruction. Both callbacks must be non-null and must not
- * reenter swxbx. drawable_size writes pixel dimensions, or zeros if hidden. */
+ * until instance destruction. All callbacks must be non-null and must not
+ * reenter swxbx. drawable_size writes pixel dimensions, or zeros if hidden.
+ * scaling runs at every present and must write the window's scaling: there is
+ * no default. swxbx initializes kind to UINT32_MAX, and a present whose
+ * scaling is unwritten or invalid returns SWXBX_BAD_ARGUMENT and names the
+ * reason through swxbx_last_error. A present blits from the presented
+ * texture's own format, reading an sRGB texture's bytes unchanged. A depth,
+ * integer or compressed texture, or one the device cannot blit into the
+ * window's images, returns SWXBX_UNIMPLEMENTED and names the reason through
+ * swxbx_last_error. */
 typedef struct swxbx_host_vulkan {
     uint32_t extension_count;
     const char *const *extensions;
@@ -41,6 +62,7 @@ typedef struct swxbx_host_vulkan {
                                uint64_t window_object, uint64_t native_window);
     void (*drawable_size)(void *user, uint64_t window_object,
                           uint32_t *width, uint32_t *height);
+    void (*scaling)(void *user, uint64_t window_object, swxbx_scaling *scaling);
 } swxbx_host_vulkan;
 
 /* What the host provides. Both callbacks return 0 on success and any other
@@ -124,28 +146,37 @@ swxbx_instance *swxbx_instance_create(const swxbx_host *host);
 void swxbx_instance_destroy(swxbx_instance *instance);
 
 /* Enable notifications for a registered pool and its aliases. Report every
- * later host storage write before submission. */
+ * later host storage write before submission. Legacy hosts remain supported. */
 swxbx_status swxbx_instance_track_pool_writes(const swxbx_instance *instance, uint64_t pool);
 swxbx_status swxbx_instance_notify_memory_write(const swxbx_instance *instance,
                                                   uint64_t address, uint64_t size);
 
 /* Adopt coherent arena storage, preserving contents. The pointer lives until
  * the last alias is finalized. Host callbacks must route storage through it.
- * Serialize mapped access with submissions, wait before each access, and report
- * writes before the next submission. Mapping returns null on failure. */
+ * Mapping and waiting first run every batch submitted on this instance before
+ * the call; batches submitted concurrently from another thread are not covered.
+ * Wait before each access and report writes before the next submission.
+ * Mapping returns null and waiting returns a status on failure; both name the
+ * reason through swxbx_last_error. */
 uint8_t *swxbx_instance_map_pool(const swxbx_instance *instance, uint64_t pool);
 swxbx_status swxbx_instance_wait_pool(const swxbx_instance *instance, uint64_t pool,
                                        uint64_t offset, uint64_t size, uint32_t write);
 
 /* Host-selected policy. Capacity is 1..16, default 2. Mode is 0 for FIFO,
- * 1 for mailbox. Changing policy drains pending callbacks first.
+ * 1 for mailbox. With a native-surface host, mailbox needs an open window
+ * whose surface offers it, and is refused by name otherwise. A mode that
+ * cannot show an open window's present interval is refused by name (native
+ * FIFO cannot present interval 0 without waiting; native mailbox cannot hold
+ * an image for interval 2 or more). Changing policy drains pending callbacks
+ * first.
  * Callback bytes are borrowed and valid until the callback returns.
  * Presentation callbacks must not reenter the library. */
 swxbx_status swxbx_instance_set_presentation(const swxbx_instance *instance,
                                                uint32_t frames_in_flight, uint32_t mode);
 
 /* wait=0 delivers one ready frame without waiting for GPU completion.
- * wait=1 drains all pending frames. The host supplies vblank pacing.
+ * wait=1 drains all pending frames. Before each delivery wait_vblank runs
+ * once per vertical blank of the window's present interval (none for 0).
  * QueueFinish and WindowFinalize also drain pending callbacks. */
 swxbx_status swxbx_instance_poll_presentations(const swxbx_instance *instance, uint32_t wait);
 
@@ -163,7 +194,8 @@ swxbx_status swxbx_instance_frame_statistics(const swxbx_instance *instance,
                                                swxbx_frame_statistics *out);
 
 /* Set or clear (with null) the directory for local debugging dumps of
- * translated shaders. Files contain translated output, never input shader bytes. */
+ * translated shaders. Files contain translated output derived from the
+ * observed program's shaders, never the original shader bytes. */
 swxbx_status swxbx_instance_set_shader_dump_directory(const swxbx_instance *instance,
                                                          const char *directory);
 
@@ -183,8 +215,9 @@ uint32_t swxbx_instance_request(const swxbx_instance *instance, const char *name
 swxbx_status swxbx_instance_call(const swxbx_instance *instance, uint32_t function,
                                    swxbx_registers *registers);
 
-/* Report a completed host call. `registers` contains its result registers so
- * diagnostics can sample results with arguments. */
+/* The original implementation of a function returned; `registers` holds its
+ * result registers. Only for hosts that let the original implementation run,
+ * so that results are sampled along with arguments. */
 swxbx_status swxbx_instance_returned(const swxbx_instance *instance, uint32_t function,
                                        const swxbx_registers *registers);
 

@@ -1,4 +1,4 @@
-//! Stage-local constant banks. Sources and experiment limits:
+//! Stage-local constant banks. Sources and experiment limits: the public contract.
 use super::{graphics::instructions, pipelines::stage_bindings};
 use ash::vk;
 use std::collections::{HashMap, HashSet};
@@ -6,36 +6,83 @@ use std::collections::{HashMap, HashSet};
 pub(crate) const BANK_SIZE: u64 = 4096 * 16;
 
 /// A translated graphics stage, independent of recorded stage tokens.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum UniformStage {
+/// SwXBx draws a vertex stage, optionally a geometry stage, and a fragment
+/// stage; it refuses tessellation stages by name.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphicsStage {
     /// Vertex shader stage.
     Vertex,
+    /// Geometry shader stage, between the vertex and fragment stages.
+    Geometry,
     /// Fragment shader stage.
     Fragment,
 }
-impl UniformStage {
+impl GraphicsStage {
+    /// Every graphics stage, in pipeline order.
+    pub const ALL: [Self; 3] = [Self::Vertex, Self::Geometry, Self::Fragment];
+
+    /// The stage a SPIR-V execution model names. Tessellation control (1)
+    /// and evaluation (2) are refused by name; the error names any other.
+    pub(crate) fn of_model(model: u32) -> Result<Self, String> {
+        match model {
+            0 => Ok(Self::Vertex),
+            3 => Ok(Self::Geometry),
+            4 => Ok(Self::Fragment),
+            1 | 2 => Err(format!(
+                "execution model {model} is a tessellation stage; swxbx draws vertex, \
+                 geometry and fragment stages only"
+            )),
+            _ => Err(format!("execution model {model} is not a graphics stage")),
+        }
+    }
+    /// The stage of a SPIR-V module's one entry point.
+    pub(crate) fn of(words: &[u32]) -> Result<Self, String> {
+        Self::of_model(super::graphics::execution_model(words)?)
+    }
     pub(crate) fn model(self) -> u32 {
         match self {
             Self::Vertex => 0,
+            Self::Geometry => 3,
             Self::Fragment => 4,
         }
     }
-    pub(crate) fn set(self) -> u32 {
+    /// The pipeline descriptor set holding this stage's constant banks.
+    pub(crate) fn bank_set(self) -> u32 {
         match self {
             Self::Vertex => 0,
             Self::Fragment => 1,
+            Self::Geometry => 4,
+        }
+    }
+    /// The pipeline descriptor set holding this stage's textures, samplers
+    /// and surfaces.
+    pub(crate) fn texture_set(self) -> u32 {
+        match self {
+            Self::Vertex => 2,
+            Self::Fragment => 3,
+            Self::Geometry => 5,
+        }
+    }
+    /// The stage's slot in per-stage arrays of draw state. Vertex and
+    /// fragment keep the slots they had before geometry stages existed.
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            Self::Vertex => 0,
+            Self::Fragment => 1,
+            Self::Geometry => 2,
         }
     }
     pub(crate) fn flags(self) -> vk::ShaderStageFlags {
         match self {
             Self::Vertex => vk::ShaderStageFlags::VERTEX,
+            Self::Geometry => vk::ShaderStageFlags::GEOMETRY,
             Self::Fragment => vk::ShaderStageFlags::FRAGMENT,
         }
     }
 }
 
 /// Host-selected interpretation of one recorded stage/index pair.
-/// Client stage meanings and binding-to-bank mappings remain unresolved.
+/// Guest stage meanings and binding-to-bank mappings remain unobserved.
 #[derive(Clone, Copy, Debug)]
 pub struct UniformBankMapping {
     /// Raw stage token supplied by the caller.
@@ -43,7 +90,7 @@ pub struct UniformBankMapping {
     /// Raw binding index supplied by the caller.
     pub index: u64,
     /// Translated shader stage receiving the bank.
-    pub target: UniformStage,
+    pub target: GraphicsStage,
     /// Uniform bank number in the translated module.
     pub bank: u32,
 }
@@ -76,14 +123,14 @@ impl UniformBufferContract {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bank {
     /// Translated shader stage.
-    pub stage: UniformStage,
+    pub stage: GraphicsStage,
     /// Uniform bank number in the translated module.
     pub bank: u32,
 }
 
 /// Accept only the translator's set-zero Block { float4[4096] } bank interface.
 /// Generic descriptor reflection still checks entry points, arrays and push constants.
-pub(crate) fn banks(words: &[u32], stage: UniformStage) -> Result<Vec<Bank>, String> {
+pub(crate) fn banks(words: &[u32], stage: GraphicsStage) -> Result<Vec<Bank>, String> {
     let bindings: Vec<_> = stage_bindings(words, stage.model())?
         .into_iter()
         .filter(|b| b.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER)
@@ -154,7 +201,11 @@ pub(crate) fn banks(words: &[u32], stage: UniformStage) -> Result<Vec<Bank>, Str
 
 /// Keep bank numbers, separate stage sets, and optionally change Uniform pointers
 /// and variables to StorageBuffer. Block layout and all loads remain unchanged.
-pub(crate) fn lower(words: &[u32], stage: UniformStage, storage: bool) -> Result<Vec<u32>, String> {
+pub(crate) fn lower(
+    words: &[u32],
+    stage: GraphicsStage,
+    storage: bool,
+) -> Result<Vec<u32>, String> {
     banks(words, stage)?;
     if storage && words[1] < 0x0001_0300 {
         return Err("storage constant banks require SPIR-V 1.3".into());
@@ -194,9 +245,9 @@ pub(crate) fn lower(words: &[u32], stage: UniformStage, storage: bool) -> Result
         match op {
             71 if args.get(1) == Some(&34) => {
                 args[2] = if textures.contains(&args[0]) {
-                    stage.set() + 2
+                    stage.texture_set()
                 } else {
-                    stage.set()
+                    stage.bank_set()
                 }
             }
             71 if args.get(1) == Some(&33) && textures.contains(&args[0]) => {
@@ -262,9 +313,9 @@ mod tests {
     fn reflects_only_complete_constant_bank_shapes() {
         let words = bank();
         assert_eq!(
-            banks(&words, UniformStage::Fragment).unwrap(),
+            banks(&words, GraphicsStage::Fragment).unwrap(),
             vec![Bank {
-                stage: UniformStage::Fragment,
+                stage: GraphicsStage::Fragment,
                 bank: 2
             }]
         );
@@ -280,14 +331,14 @@ mod tests {
                 }
                 at += count;
             }
-            assert!(banks(&changed, UniformStage::Fragment).is_err());
+            assert!(banks(&changed, GraphicsStage::Fragment).is_err());
         }
     }
     #[test]
     fn keeps_binding_and_layout_while_separating_sets_and_lowering_storage() {
         let words = bank();
-        let uniform = lower(&words, UniformStage::Fragment, false).unwrap();
-        let storage = lower(&words, UniformStage::Fragment, true).unwrap();
+        let uniform = lower(&words, GraphicsStage::Fragment, false).unwrap();
+        let storage = lower(&words, GraphicsStage::Fragment, true).unwrap();
         for (words, kind) in [
             (&uniform, vk::DescriptorType::UNIFORM_BUFFER),
             (&storage, vk::DescriptorType::STORAGE_BUFFER),
@@ -309,7 +360,7 @@ mod tests {
             std::env::temp_dir().join(format!("uniform-validation-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         for storage in [false, true] {
-            let words = lower(&bank(), UniformStage::Fragment, storage).unwrap();
+            let words = lower(&bank(), GraphicsStage::Fragment, storage).unwrap();
             let path = directory.join(format!("bank-{storage}.spv"));
             fs::write(
                 &path,

@@ -1,4 +1,4 @@
-//! Startup translation loading and owned background work.
+//! Startup translation loading and owned background work. Source: the public contract.
 pub use crate::workers::{
     PipelineRequest as TranslationRequest, PipelineStatus as TranslationStatus,
 };
@@ -21,18 +21,64 @@ const MAX_RECORD: u64 = 64 * 1024 * 1024;
 const MAX_INDEX: u64 = 256 * 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Explicit host translation inputs. The host adapter supplies the translator
-/// identity and reports absent required state with None. No input enums are inferred.
+/// Explicit host translation inputs. The host adapter derives the exact upstream
+/// identity and reports absent required state with None. No guest enums are inferred.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct TranslationContext {
     /// Translator target generation included in the cache identity.
     pub generation: u8,
     /// Whether translation may assume a zero global-address delta.
     pub global_delta_zero: bool,
-    /// Optional explicit geometry input state used by the translator.
-    pub geometry_input: Option<u8>,
+    /// The input primitive of the draw a geometry stage is translated for.
+    /// A geometry stage's code does not state it: the draw's topology does
+    /// (the reference host Gpu/Shader/GpuAccessor.cs QueryPrimitiveTopology). SwXBx
+    /// fills it per draw for code whose translator says it needs it.
+    pub geometry_input: Option<InputPrimitive>,
     /// Optional explicit tessellation state used by the translator.
     pub tessellation: Option<[u8; 3]>,
+    /// The sampled images of the translated stage whose bound texture reads
+    /// texel coordinates (NVN target RECTANGLE), in ascending order. Empty
+    /// means every sampled image reads normalized coordinates. SwXBx fills
+    /// it per draw from the bound textures; a translator that cannot honour
+    /// it must refuse a context that names any.
+    pub texel_images: Vec<SampledImage>,
+}
+
+/// The primitive a geometry stage receives, by the class of the draw's
+/// topology (the reference host Shader/InputTopology.cs; Gpu/Shader/GpuAccessor.cs
+/// ConvertToInputTopology).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum InputPrimitive {
+    /// One vertex per primitive.
+    Points,
+    /// Two vertices per primitive.
+    Lines,
+    /// Two vertices with two adjacent ones per primitive.
+    LinesAdjacency,
+    /// Three vertices per primitive.
+    Triangles,
+    /// Three vertices with three adjacent ones per primitive.
+    TrianglesAdjacency,
+}
+
+/// What translating a shader's code needs beyond the code and the
+/// instance's translation context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranslationNeeds {
+    /// The code translates as it is registered.
+    Code,
+    /// The code is a geometry stage, whose input primitive is the draw's:
+    /// each draw translates it for its own topology.
+    InputPrimitive,
+}
+
+/// One sampled-image descriptor of a translated module.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SampledImage {
+    /// Descriptor set.
+    pub set: u32,
+    /// Descriptor binding of the sampled image.
+    pub binding: u32,
 }
 
 /// Owned translated module, cache identity, and execution requirements.
@@ -44,13 +90,16 @@ pub struct TranslatedShader {
     pub words: Vec<u32>,
     /// Whether pipeline creation must require 32-lane subgroups.
     pub requires_subgroup_size_32: bool,
-    /// Whether execution requires helper demotion.
+    /// Whether execution requires helper demotion. Evidence: the public contract.
     pub requires_demote_to_helper_invocation: bool,
-    /// Whether execution requires maximal reconvergence.
+    /// Whether execution requires maximal reconvergence. Evidence: the public contract.
     pub requires_maximal_reconvergence: bool,
     /// Storage-image views the module declares, each bound from its guest
     /// image handle before execution.
     pub surfaces: Vec<crate::surfaces::SurfaceBinding>,
+    /// Sampled textures whose handle the module computes, each bound from
+    /// the locations of its handle words before execution.
+    pub textures: Vec<crate::surfaces::BindlessTexture>,
 }
 
 /// Host-owned persistence directory, translation inputs, and bounded worker settings.
@@ -363,6 +412,7 @@ impl StartupCache {
                         requires_demote_to_helper_invocation: false,
                         requires_maximal_reconvergence: false,
                         surfaces: Vec::new(),
+                        textures: Vec::new(),
                     }))
                 }
             },
@@ -662,6 +712,7 @@ mod tests {
                 requires_maximal_reconvergence: maximal,
                 requires_demote_to_helper_invocation: demote,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             }))
         }
         fn translate_for_context(
@@ -677,6 +728,7 @@ mod tests {
                 requires_demote_to_helper_invocation: false,
                 requires_maximal_reconvergence: false,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             })
         }
     }
@@ -781,6 +833,7 @@ mod tests {
                 requires_maximal_reconvergence: false,
                 requires_demote_to_helper_invocation: false,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             }))
         }
     }
@@ -854,6 +907,7 @@ mod tests {
                 requires_demote_to_helper_invocation: flags & 4 != 0,
                 requires_maximal_reconvergence: flags & 2 != 0,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             };
             let translator = Translator::new(Duration::ZERO);
             let directory = Directory::new();
@@ -880,6 +934,7 @@ mod tests {
                 requires_demote_to_helper_invocation: false,
                 requires_maximal_reconvergence: false,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             };
             let mut bytes = translator
                 .encode_cache_record(&shader, &TranslationContext::default())
@@ -980,7 +1035,7 @@ mod tests {
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
         drop(cache);
         let mut config = directory.config();
-        config.context.geometry_input = Some(1);
+        config.context.geometry_input = Some(InputPrimitive::Lines);
         let mut known = StartupCache::open(config, translator).unwrap();
         ready(&request(&mut known, b"missing"));
         assert_eq!(known.stats().translated, 1);

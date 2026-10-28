@@ -1,7 +1,8 @@
 //! What a submitted batch does at a command swxbx cannot run yet.
+//! Source: the public contract.
 //!
-//! The default stops the batch at that command and reports its status.
-//! `SWXBX_UNSUPPORTED_COMMANDS=skip` selects a
+//! The default stops the batch at that command and reports its status, as
+//! the public contract requires. `SWXBX_UNSUPPORTED_COMMANDS=skip` selects a
 //! diagnostic mode instead: the command is logged, counted and skipped, and
 //! the batch carries on so that later syncs still signal.
 
@@ -23,6 +24,13 @@ pub(crate) enum UnsupportedCommands {
     Stop,
     /// The command is recorded and execution continues with the next one.
     Skip(Mutex<Ledger>),
+}
+
+/// A batch that ended before its last command: the batch's status, and the
+/// command it stopped at with the reason it was refused.
+pub(crate) struct Stopped {
+    pub status: Status,
+    pub at: String,
 }
 
 /// The skippable ways a command can fail. Every other status means state
@@ -78,6 +86,18 @@ impl fmt::Display for Ledger {
     }
 }
 
+/// Refuse the command being recorded or executed. The reason names what the
+/// caller asked for that swxbx cannot do; it goes to standard error and to
+/// `swxbx_last_error` on the refusing thread. The returned status is the
+/// one the recording call returns, or the one the batch stops on.
+/// Source: the public contract.
+pub(crate) fn refuse(status: Status, reason: impl fmt::Display) -> Status {
+    let reason = reason.to_string();
+    eprintln!("swxbx: refused ({status:?}): {reason}");
+    crate::set_last_error(&reason);
+    status
+}
+
 impl UnsupportedCommands {
     /// Read the choice from the environment. Unset means `Stop`.
     ///
@@ -100,17 +120,24 @@ impl UnsupportedCommands {
     }
 
     /// Settle the status of one executed command. `Err` ends the batch with
-    /// that status; `Ok` continues with the next command.
-    pub fn settle(&self, command: &RecordedCommand, status: Status) -> Result<(), Status> {
+    /// that status and names where and why it stopped; `Ok` continues with
+    /// the next command.
+    pub fn settle(&self, command: &RecordedCommand, status: Status) -> Result<(), Stopped> {
         if status == Status::Ok {
             return Ok(());
         }
         let name = command_name(command);
         let (Self::Skip(ledger), Some(outcome)) = (self, Outcome::of(status)) else {
             // The batch's status belongs to the batch, which already
-            // returned to the program, so it is reported here.
+            // returned to the program, so it is reported here. Source: the public contract.
             eprintln!("swxbx: batch stopped at {name} ({status:?})");
-            return Err(status);
+            return Err(Stopped {
+                status,
+                at: match crate::last_error() {
+                    Some(reason) => format!("{name} ({status:?}): {reason}"),
+                    None => format!("{name} ({status:?})"),
+                },
+            });
         };
         let mut ledger = ledger.lock().unwrap_or_else(|p| p.into_inner());
         let count = ledger.skipped.entry((name, outcome)).or_default();
@@ -140,7 +167,7 @@ impl UnsupportedCommands {
     }
 }
 
-fn command_name(command: &RecordedCommand) -> &'static str {
+pub(crate) fn command_name(command: &RecordedCommand) -> &'static str {
     match command {
         RecordedCommand::Operation { kind, .. } => kind,
         RecordedCommand::ReportCounter { .. } => "ReportCounter",
@@ -171,6 +198,7 @@ fn command_name(command: &RecordedCommand) -> &'static str {
             StateCommand::Barrier(_) => "Barrier",
             StateCommand::TiledCacheAction(_) => "TiledCacheAction",
             StateCommand::BindUniformBuffer { .. } => "BindUniformBuffer",
+            StateCommand::BindTexelBuffer { .. } => "BindTexelBuffer",
             StateCommand::BindVertexBuffer { .. } => "BindVertexBuffer",
             StateCommand::BindHandle { .. } => "BindHandle",
             StateCommand::ClearBuffer { .. } => "ClearBuffer",

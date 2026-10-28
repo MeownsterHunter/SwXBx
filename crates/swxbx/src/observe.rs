@@ -1,4 +1,5 @@
-//! Records the shape of values passed to and returned from host functions.
+//! Records the shape of the values a program passes to and gets back from
+//! each function, while the original implementation still does the work.
 //!
 //! Nothing is known about any function's signature at the start. Watching
 //! what the argument registers hold across many calls shows which of them

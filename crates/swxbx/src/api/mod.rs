@@ -6,14 +6,15 @@
 //! no handler is reported as `Status::Unimplemented`, and the host decides
 //! what to do about that.
 //!
-//! Handlers validate every interpreted argument before changing instance
-//! state. Unresolved inputs remain explicit unsupported states.
+//! What a function does comes from `docs/signatures`, and nothing else. A
+//! handler that goes beyond what has been observed says so in a comment.
 
 mod commands;
 mod device;
 #[cfg(feature = "vulkan")]
 mod drawing;
 mod memory;
+mod misuse;
 mod objects;
 mod operations;
 mod program_memory;
@@ -21,11 +22,15 @@ pub(crate) mod queue;
 mod recording;
 mod recordings;
 mod resources;
+#[cfg(feature = "vulkan")]
+pub(crate) mod specialization;
 mod state;
 mod state_commands;
 
 use crate::functions::FunctionId;
 use crate::instance::{Instance, Registers, Status};
+#[cfg(feature = "vulkan")]
+pub(crate) use misuse::CopyRules;
 #[cfg(feature = "vulkan")]
 pub use objects::SamplerDescription;
 pub use objects::{GpuAddress, GpuAddressError, Object, Objects, ShaderRecord, ShaderTranslation};
@@ -75,7 +80,7 @@ fn read_f32x4(instance: &crate::instance::InstanceState, address: u64) -> Option
 }
 
 /// A handler that records nothing and reports success. Used for functions
-/// whose effect is on the host side only (flushing, waiting)
+/// whose observed effect is on the platform's side only (flushing, waiting)
 /// or that only tune the object (set-defaults calls).
 fn accept(_instance: &Instance, _function: FunctionId, registers: &mut Registers) -> Status {
     registers.x[0] = 0;
@@ -83,7 +88,7 @@ fn accept(_instance: &Instance, _function: FunctionId, registers: &mut Registers
 }
 
 /// A handler for the `...Initialize(object, builder)` family: records the
-/// object and answers 1, the success value defined by the host contract.
+/// object and answers 1, the value every observed initialise call returned.
 fn succeed(registers: &mut Registers) -> Status {
     registers.x[0] = 1;
     Status::Ok
@@ -145,6 +150,8 @@ mod tests {
         "nvnWindowBuilderSetDevice",
         "nvnWindowBuilderSetNativeWindow",
         "nvnWindowBuilderSetTextures",
+        "nvnWindowBuilderSetPresentInterval",
+        "nvnWindowBuilderGetPresentInterval",
         "nvnWindowInitialize",
         "nvnWindowFinalize",
         "nvnWindowSetPresentInterval",

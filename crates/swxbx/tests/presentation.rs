@@ -1,4 +1,4 @@
-//! Synthetic presentation and arena tests.
+//! Synthetic presentation and arena tests. Source: the public contract.-presentation.
 #![cfg(feature = "vulkan")]
 
 use ash::vk;
@@ -333,7 +333,7 @@ fn offscreen_present_converts_bgra_and_srgb_and_scales() {
     let mut backend = Backend::new(1.0).expect("Vulkan device is required");
     assert!(backend.ensure(1, 3, 2, false));
     for frame in 0..48 {
-        assert!(backend.clear_color(1, [1.0, 0.5, 0.25, 1.0], 15));
+        assert!(backend.clear_color(1, [1.0, 0.5, 0.25, 1.0], 15).is_ok());
         let format = if frame % 2 == 0 {
             vk::Format::B8G8R8A8_UNORM
         } else {

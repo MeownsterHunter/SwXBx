@@ -1,8 +1,9 @@
-//! Memory pools.
+//! Memory pools. Signatures: docs/signatures/0003-objects.md.
 //!
 //! The program gives a pool its storage, a block of its own memory. swxbx
 //! keeps CPU storage separate from GPU addresses when Vulkan is active.
-//! The flat backing uses checked guest-to-host address mappings.
+//! The flat backing and its implementation choices are documented in
+//! the documented contract
 
 use super::{objects::Object, succeed, Handler};
 use crate::instance::{Instance, Registers, Status};

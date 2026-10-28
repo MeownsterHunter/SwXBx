@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Owned command and argument snapshots produced by recording.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordedCommand {
-    /// Deferred command hypotheses. See
+    /// Deferred command hypotheses. See the public contract.
     Operation {
         /// Unprefixed command family.
         kind: &'static str,
@@ -21,14 +21,14 @@ pub enum RecordedCommand {
         arguments: [u64; 7],
     },
     /// Write a counter report when the queue reaches this command.
-    ///
+    /// Source: the public contract.
     ReportCounter {
         /// The counter the guest token selected.
         counter: crate::counters::Counter,
         /// GPU address of the sixteen-byte report.
         address: u64,
     },
-    /// Start a new accumulation interval for a counter.
+    /// Start a new accumulation interval for a counter. Source: the public contract.
     ResetCounter(crate::counters::Counter),
     /// Select retained color and depth texture keys with opaque view arguments.
     SetRenderTargets {
@@ -125,7 +125,7 @@ pub enum RecordedCommand {
         /// Signed adjustment added to each index.
         base_vertex: i32,
     },
-    /// State retained without execution.
+    /// State retained without execution. Provenance: note 0026.
     State(StateCommand),
     /// Retain an unsupported command without assigning argument meanings.
     Raw {
@@ -139,7 +139,7 @@ pub enum RecordedCommand {
 /// Setter names paired with six retained integer argument registers.
 pub type StateSettings = Vec<(&'static str, [u64; 6])>;
 
-/// Recording fields from the host contract.
+/// Recording fields from signatures 0010 and 0011. Values stay opaque and wide;
 /// this representation does not assign enumeration meanings or integer widths.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateCommand {
@@ -165,7 +165,7 @@ pub enum StateCommand {
         /// stride or pointer-array layout is inferred for subsequent elements.
         first_settings: Option<StateSettings>,
         /// Bounded snapshots using explicit host spacing, only for opt-in drawing.
-        /// This does not establish a program-memory layout.
+        /// This does not establish a program-memory layout. the public contract.
         experiment_settings: Option<Vec<StateSettings>>,
     },
     /// Select the descriptor pool object key.
@@ -216,7 +216,7 @@ pub enum StateCommand {
         /// Raw retained value for the enclosing command.
         value: u64,
     },
-    /// Opt-in float-order hypothesis. See
+    /// Opt-in float-order hypothesis. See the public contract.
     PolygonOffset([u64; 3]),
     /// Retain the raw barrier mask.
     Barrier(u64),
@@ -232,6 +232,14 @@ pub enum StateCommand {
         address: u64,
         /// Recorded range length in bytes.
         size: u64,
+    },
+    /// Bind a typed buffer view supplied by a host adapter.
+    BindTexelBuffer {
+        stage: u64,
+        index: u64,
+        address: u64,
+        size: u64,
+        format: u32,
     },
     /// Retain a vertex stream GPU address and byte size.
     BindVertexBuffer {
@@ -282,7 +290,7 @@ pub struct TextureImage {
 /// Shader registration values retained without decoding private layouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaderRecord {
-    /// Program address of the shader record.
+    /// Program address of the observed shader record.
     pub record_address: u64,
     /// The two GPU addresses retained from the record.
     pub gpu_addresses: [u64; 2],
@@ -299,6 +307,10 @@ pub enum ShaderTranslation {
     Deferred(Vec<u8>, crate::startup_cache::TranslationContext),
     /// Completed translated SPIR-V module.
     Spirv(Vec<u32>),
+    /// Code whose translation needs the draw's input primitive (a geometry
+    /// stage). Each draw translates it for its own topology; the address
+    /// of the shared bytes names the code for as long as the program holds it.
+    ByInputPrimitive(std::sync::Arc<Vec<u8>>),
     /// Translation failed with this diagnostic.
     Error(String),
 }
@@ -310,7 +322,7 @@ pub enum Object {
     /// No object state has been established at this key.
     #[default]
     Unknown,
-    /// Device builder settings retained from setter calls.
+    /// Device builder settings retained from observed setter calls.
     DeviceBuilder {
         /// Raw flags retained from the caller; no enum meaning is implied.
         flags: u64,
@@ -324,7 +336,7 @@ pub enum Object {
         /// Raw window-origin token.
         window_origin_mode: u64,
     },
-    /// Queue builder settings retained from setter calls.
+    /// Queue builder settings retained from observed setter calls.
     QueueBuilder {
         /// Device object key supplied by the host.
         device: u64,
@@ -346,6 +358,8 @@ pub enum Object {
         native_window: u64,
         /// Texture object keys attached to the window.
         textures: Vec<u64>,
+        /// The interval the window starts with; checked when it initializes.
+        present_interval: crate::presentation::PresentInterval,
     },
     /// Presentation state for an initialized window.
     Window {
@@ -353,8 +367,8 @@ pub enum Object {
         device: u64,
         /// Texture object keys attached to the window.
         textures: Vec<u64>,
-        /// Zero requests unpaced presentation; positive values request FIFO.
-        present_interval: u32,
+        /// How long the guest asks each presented image to stay on screen.
+        present_interval: crate::presentation::PresentInterval,
         /// Index of the texture the next acquire hands out.
         next_texture: u32,
     },
@@ -389,7 +403,7 @@ pub enum Object {
         /// Length of the storage range in bytes.
         size: u64,
     },
-    /// Registered pool and its assigned or callback-provided GPU address.
+    /// Registered pool and its assigned or observed GPU address.
     MemoryPool {
         /// Device object key supplied by the host.
         device: u64,
@@ -401,7 +415,7 @@ pub enum Object {
         size: u64,
         /// Assigned guest GPU base, if allocation succeeded.
         gpu_address: Option<u64>,
-        /// Host callback return used only to resolve diagnostic reads.
+        /// Original driver return used only to resolve observation reads.
         observed_gpu_address: Option<u64>,
     },
     /// Texture description retained from builder calls.
@@ -548,7 +562,7 @@ pub struct SamplerDescription {
 /// Thread-safe object table keyed by program object address.
 #[derive(Default, Clone)]
 pub struct Objects {
-    map: Arc<Mutex<HashMap<u64, Object>>>,
+    map: Arc<Mutex<crate::keymap::KeyMap<u64, Object>>>,
     recordings: Arc<super::recordings::Recordings>,
     gpu_pools: Arc<Mutex<Vec<CachedGpuPool>>>,
 }
@@ -603,13 +617,13 @@ impl Objects {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Object>> {
+    fn lock(&self) -> MutexGuard<'_, crate::keymap::KeyMap<u64, Object>> {
         self.map
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn refresh_gpu_pools(&self, objects: &HashMap<u64, Object>) {
+    fn refresh_gpu_pools(&self, objects: &crate::keymap::KeyMap<u64, Object>) {
         let mut pools = self.gpu_pools.lock().unwrap_or_else(|p| p.into_inner());
         pools.clear();
         pools.extend(objects.iter().filter_map(|(&pool, object)| {
@@ -656,6 +670,23 @@ impl Objects {
         self.lock().get(&address).cloned()
     }
 
+    /// Read the part of an object record a caller needs without copying the
+    /// record; `read` must not use these objects again.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn with<R>(&self, address: u64, read: impl FnOnce(&Object) -> R) -> Option<R> {
+        self.lock().get(&address).map(read)
+    }
+
+    /// The description of the texture at `address`, if that object is a texture.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn texture_description(&self, address: u64) -> Option<TextureDescription> {
+        self.with(address, |object| match object {
+            Object::Texture { description, .. } => Some(description.clone()),
+            _ => None,
+        })
+        .flatten()
+    }
+
     /// Remove and return an object record, or None if the key is absent.
     pub fn remove(&self, address: u64) -> Option<Object> {
         let mut map = self.lock();
@@ -699,12 +730,12 @@ impl Objects {
         self.lock().is_empty()
     }
 
-    /// Resolve assigned or callback-provided GPU ranges to CPU storage. Callback addresses
+    /// Resolve assigned or observed GPU ranges to CPU storage. Observed addresses
     /// never replace an assigned Vulkan base.
     pub fn resolve_gpu_address(&self, address: u64) -> Result<GpuAddress, GpuAddressError> {
         let pools = self.gpu_pools.lock().unwrap_or_else(|p| p.into_inner());
         let mut matched_base = None;
-        // Assigned ranges have precedence over the callback-provided alias.
+        // Assigned ranges have precedence over the extra observed alias.
         for alias in [false, true] {
             for cached in pools.iter().copied() {
                 let Some(base) = cached.base(alias) else {
@@ -751,14 +782,42 @@ impl Objects {
             .collect()
     }
 
+    /// Every window and its present interval.
+    pub(crate) fn window_intervals(&self) -> Vec<(u64, crate::presentation::PresentInterval)> {
+        self.lock()
+            .iter()
+            .filter_map(|(&window, object)| match object {
+                Object::Window {
+                    present_interval, ..
+                } => Some((window, *present_interval)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Start a recording without touching the shared object table.
     pub fn begin_recording(&self, address: u64) -> bool {
         self.recordings.begin(address)
     }
 
-    /// Append using an atomic per-buffer ownership transfer.
-    pub fn record_command(&self, address: u64, command: RecordedCommand) -> bool {
-        self.recordings.push(address, command)
+    /// Append what the buffer's facts admit, using an atomic per-buffer
+    /// ownership transfer.
+    pub(super) fn record_command(
+        &self,
+        address: u64,
+        command: RecordedCommand,
+        admit: impl FnOnce(&mut super::misuse::Facts, &RecordedCommand) -> Result<(), crate::Status>,
+    ) -> Result<(), crate::Status> {
+        self.recordings.push(address, command, admit)
+    }
+
+    /// Append a typed command supplied directly by a host adapter.
+    pub(crate) fn record_host_command(
+        &self,
+        address: u64,
+        command: RecordedCommand,
+    ) -> Result<(), crate::Status> {
+        self.recordings.push(address, command, |_, _| Ok(()))
     }
 
     /// Publish an owned command list and return its one-shot handle.

@@ -1,4 +1,4 @@
-//! Lock-free frame exchange for application adapters and presentation hosts.
+//! Lock-free host frame exchange for emulator adapters and presentation hosts.
 
 use std::{
     fs::{File, OpenOptions},

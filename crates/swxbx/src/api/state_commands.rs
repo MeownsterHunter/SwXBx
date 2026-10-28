@@ -1,4 +1,4 @@
-//! Command-state recording under explicit host contracts.
+//! Command-state recording. Signatures 0010 and 0011, provenance notes 0026 and 0028.
 //! Polygon offset retains a raw three-register hypothesis for opt-in execution.
 //! No command here executes, writes
 //! program memory, signals synchronization, or allocates rendering resources.
@@ -247,7 +247,7 @@ mod tests {
         use StateCommand::*;
         let instance = Instance::new();
         start(&instance, 0x200);
-        // Exercise the full register width.
+        // Deliberately wider than the samples. Widths have not been observed.
         let a = 0x1234_5678_0000_0001;
         let b = 0x2345_6789_0000_0002;
         let c = 0x3456_789a_0000_0003;
@@ -563,7 +563,8 @@ mod tests {
             reads.store(0, Ordering::Relaxed);
             let id = functions::lookup(name).unwrap();
             let mut r = Registers::default();
-            // Direct handler calls exclude diagnostic register sampling.
+            // Direct handler calls exclude the independent shape observer,
+            // which samples readable registers in Instance::call.
             for address in [0x200, 0x300] {
                 r.x = [address, u64::MAX, u64::MAX, u64::MAX, 4, 5, 6, 7];
                 assert_eq!(record_state(&instance, id, &mut r), Status::Ok);
@@ -760,16 +761,11 @@ mod tests {
         // Assert that the submission actually consumed a nonempty recording.
         assert_eq!(instance.objects.recording_len(handle), Some(NAMES.len()));
         r.x[..3].copy_from_slice(&[0x700, 1, 0x1000]);
-        #[cfg(feature = "vulkan")]
-        let expected = if instance.gpu.lock().unwrap().is_some() {
-            Status::Unimplemented
-        } else {
-            Status::Ok
-        };
-        #[cfg(not(feature = "vulkan"))]
-        let expected = Status::Ok;
         assert_eq!(call(&instance, "QueueSubmitCommands", &mut r), Status::Ok);
-        assert_eq!(instance.queue.drain().status(), expected);
+        assert_eq!(
+            instance.queue.drain(crate::execution::Reach::Completed),
+            crate::execution::Drained::Ran
+        );
         assert!(instance.objects.recording(handle).is_none());
         assert_eq!(memory.writes.load(Ordering::Relaxed), 0);
         assert_eq!(memory.buffer, [0xa5; 16]);

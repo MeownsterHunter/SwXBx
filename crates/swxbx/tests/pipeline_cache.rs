@@ -1,4 +1,4 @@
-//! Host cache and scheduling checks.
+//! Original host cache and scheduling experiments. Evidence: the public contract.
 #![cfg(feature = "vulkan")]
 
 use std::{

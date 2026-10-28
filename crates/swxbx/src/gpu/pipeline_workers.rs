@@ -1,4 +1,4 @@
-//! Shared bounded worker service.
+//! Shared bounded worker service. Evidence: the public contract and 0031.
 pub(crate) use crate::workers::AsyncPipelines;
 pub use crate::workers::RequestError;
 /// Owned completion handle for an asynchronous compute or graphics compilation.

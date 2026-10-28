@@ -1,4 +1,4 @@
-//! Private, disposable pipeline cache files.
+//! Private, disposable pipeline cache files. Evidence: the public contract.
 use ash::vk;
 use std::{
     fs::{self, File, OpenOptions},
@@ -200,6 +200,7 @@ impl DiskCache {
             requires_demote_to_helper_invocation: required & 4 != 0,
             requires_maximal_reconvergence: required & 2 != 0,
             surfaces: Vec::new(),
+            textures: Vec::new(),
         }))
     }
 
@@ -208,9 +209,9 @@ impl DiskCache {
         program: &[u8],
         shader: &crate::startup_cache::TranslatedShader,
     ) -> io::Result<()> {
-        // The record has no form for surface bindings; such a module is
-        // remembered in memory only.
-        if !shader.surfaces.is_empty() {
+        // The record has no form for surface or bindless texture bindings;
+        // such a module is remembered in memory only.
+        if !shader.surfaces.is_empty() || !shader.textures.is_empty() {
             return Ok(());
         }
         let mut record = vec![
@@ -313,6 +314,7 @@ mod tests {
                 requires_demote_to_helper_invocation: flags & 4 != 0,
                 requires_maximal_reconvergence: flags & 2 != 0,
                 surfaces: Vec::new(),
+                textures: Vec::new(),
             };
             disk.save_shader(b"program", &shader).unwrap();
             let reopened = cache(&root, "v1", "", 1, 2);
@@ -396,7 +398,7 @@ mod tests {
             cache.load_translation(b"program").unwrap(),
             Some(vec![4, 5])
         );
-        // A complete envelope with a different input also misses.
+        // A complete envelope with the wrong original input also misses.
         cache
             .write(
                 &DiskCache::translation_name(b"program"),

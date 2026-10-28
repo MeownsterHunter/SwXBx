@@ -1,4 +1,4 @@
-//! Content-keyed compute pipelines.
+//! Content-keyed compute pipelines. Evidence: the public contract, 0026, and 0037.
 use super::{Context, GlobalMemory};
 use crate::{
     startup_cache::{TranslatedShader, TranslationContext},
@@ -146,16 +146,31 @@ pub(super) fn stage_bindings(words: &[u32], model: u32) -> Result<Vec<Descriptor
         if storage == 9 {
             push_blocks += 1;
             let (opcode, structure) = node(type_id)?;
-            if opcode != 30
-                || structure.len() != 2
-                || offsets.get(&(type_id, 0)) != Some(&0)
-                || !decorations.get(&type_id).is_some_and(|d| d.block)
-            {
-                return Err("expected only the global delta push constant".into());
+            if opcode != 30 || !decorations.get(&type_id).is_some_and(|d| d.block) {
+                return Err("expected a push constant block".into());
             }
-            let (opcode, integer) = node(structure[1])?;
-            if opcode != 21 || integer.get(1..) != Some(&[64, 0][..]) {
-                return Err("global delta must be uint64".into());
+            let member = |index: u32| {
+                node(structure[1 + index as usize])
+                    .map(|(opcode, ty)| (opcode, ty.get(1..), offsets.get(&(type_id, index))))
+            };
+            match structure.len() {
+                // The global delta: one uint64 at offset 0.
+                2 => {
+                    if member(0)? != (21, Some(&[64, 0][..]), Some(&0)) {
+                        return Err("global delta must be uint64 at offset 0".into());
+                    }
+                }
+                // The window-to-clip scale of a disabled viewport
+                // transform: two binary32 at PUSH_VIEWPORT_INVERSE_OFFSET.
+                3 => {
+                    let at = super::graphics::PUSH_VIEWPORT_INVERSE_OFFSET;
+                    if member(0)? != (22, Some(&[32][..]), Some(&at))
+                        || member(1)? != (22, Some(&[32][..]), Some(&(at + 4)))
+                    {
+                        return Err("viewport scale must be two binary32 at offset 8".into());
+                    }
+                }
+                _ => return Err("unknown push constant block".into()),
             }
             continue;
         }
@@ -196,9 +211,11 @@ pub(super) fn stage_bindings(words: &[u32], model: u32) -> Result<Vec<Descriptor
         let (opcode, ty) = node(type_id)?;
         let descriptor_type = match (storage, opcode) {
             (0, 26) => vk::DescriptorType::SAMPLER,
-            (0, 25) if ty.len() >= 8 && matches!(ty[2], 0..=3) => match ty[6] {
-                1 => vk::DescriptorType::SAMPLED_IMAGE,
-                2 => vk::DescriptorType::STORAGE_IMAGE,
+            (0, 25) if ty.len() >= 8 && matches!(ty[2], 0..=3 | 5) => match (ty[2], ty[6]) {
+                (5, 1) => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                (5, 2) => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                (_, 1) => vk::DescriptorType::SAMPLED_IMAGE,
+                (_, 2) => vk::DescriptorType::STORAGE_IMAGE,
                 _ => return Err("unknown image descriptor type".into()),
             },
             (2, 30) if decorations.get(&type_id).is_some_and(|d| d.block) => {
@@ -905,6 +922,7 @@ mod tests {
         instruction(&mut words, 30, &[9, 8]);
         instruction(&mut words, 71, &[9, 2]);
         instruction(&mut words, 28, &[10, 7, 2]);
+        instruction(&mut words, 25, &[30, 3, 5, 0, 0, 0, 1, 0]);
         // UBO array, separate texture/sampler, storage image, storage buffer
         // with a runtime member array. Set 1 is intentionally absent.
         for (id, ty, storage, set, binding) in [
@@ -913,6 +931,7 @@ mod tests {
             (24, 5, 0, 0, 13),
             (26, 6, 0, 2, 2048),
             (28, 9, 12, 2, 5),
+            (31, 30, 0, 1, 128),
         ] {
             instruction(&mut words, 32, &[id, storage, ty]);
             instruction(&mut words, 59, &[id, id + 1, storage]);
@@ -925,11 +944,12 @@ mod tests {
     #[test]
     fn reflects_resource_types_counts_and_sparse_binding_numbers() {
         let bindings = compute_bindings(&interface()).unwrap();
-        assert_eq!(bindings.len(), 5);
+        assert_eq!(bindings.len(), 6);
         for (binding, (set, number, ty, count)) in bindings.iter().zip([
             (0, 3, vk::DescriptorType::UNIFORM_BUFFER, 3),
             (0, 12, vk::DescriptorType::SAMPLED_IMAGE, 1),
             (0, 13, vk::DescriptorType::SAMPLER, 1),
+            (1, 128, vk::DescriptorType::UNIFORM_TEXEL_BUFFER, 1),
             (2, 5, vk::DescriptorType::STORAGE_BUFFER, 1),
             (2, 2048, vk::DescriptorType::STORAGE_IMAGE, 1),
         ]) {
@@ -972,7 +992,8 @@ mod tests {
         instruction(&mut words, 32, &[52, 9, 51]);
         instruction(&mut words, 59, &[52, 53, 9]);
         assert!(compute_bindings(&words).is_ok());
-        // Extra members would need a different pipeline layout contract.
+        // A second member makes the block the two-float viewport scale, whose
+        // members are then checked.
         let at = words
             .windows(3)
             .position(|w| w == [(3 << 16) | 30, 51, 50])
@@ -980,7 +1001,7 @@ mod tests {
         words.splice(at..at + 3, [(4 << 16) | 30, 51, 50, 1]);
         assert!(compute_bindings(&words)
             .unwrap_err()
-            .contains("only the global delta"));
+            .contains("viewport scale must be two binary32"));
     }
 
     #[test]

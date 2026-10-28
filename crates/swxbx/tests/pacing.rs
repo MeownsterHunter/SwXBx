@@ -1,4 +1,4 @@
-//! Callback ordering and GPU retirement checks.
+//! Original callback ordering and GPU retirement checks. Source: the public contract.
 
 use std::{ffi::c_void, sync::Mutex};
 use swxbx::{Host, Instance, PresentationConfig, PresentationMode, Registers, Status};

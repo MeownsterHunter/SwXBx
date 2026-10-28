@@ -1,4 +1,5 @@
 //! Queue, sync, event and window objects.
+//! Signatures: docs/signatures/0001-setup.md, 0003-objects.md, 0004-pointers.md.
 
 use super::{
     accept,
@@ -131,6 +132,12 @@ pub(crate) fn execute(
             return Status::BadArgument;
         }
     }
+    #[cfg(feature = "vulkan")]
+    if let Some(backend) = gpu.as_mut() {
+        for range in host_writes.intersections(0..u64::MAX) {
+            backend.host_wrote(range.start, range.end - range.start);
+        }
+    }
     let submitted = (|| {
         for (handle, commands) in buffers {
             #[cfg(feature = "vulkan")]
@@ -146,6 +153,8 @@ pub(crate) fn execute(
             let mut operation_state = super::operations::State::default();
             let mut commands = commands;
             'commands: for command in commands.drain(..) {
+                // A stopped batch names the reason its own command gave.
+                crate::clear_last_error();
                 let status = 'command: {
                     #[cfg(feature = "vulkan")]
                     if !matches!(
@@ -161,7 +170,7 @@ pub(crate) fn execute(
                     ) {
                         if let Some(backend) = gpu.as_mut() {
                             if backend.finish_draws().is_none() {
-                                break 'command Status::InternalError;
+                                break 'command crate::unsupported::refuse(Status::InternalError, "the device could not finish the draws recorded before this command");
                             }
                         }
                     }
@@ -211,24 +220,30 @@ pub(crate) fn execute(
                             let Some(Object::Texture { description, image }) =
                                 instance.objects.get(texture)
                             else {
-                                break 'command Status::BadArgument;
+                                break 'command crate::unsupported::refuse(Status::BadArgument, format_args!("ClearColor: colour target {index} is object {texture}, which is not a texture"));
                             };
                             #[cfg(feature = "vulkan")]
                             if let Some(backend) = gpu.as_mut() {
                                 if !backend.ensure_texture(texture, &description, false) {
-                                    break 'command Status::BadArgument;
+                                    break 'command crate::unsupported::refuse(
+                                        Status::BadArgument,
+                                        format_args!(
+                                            "ClearColor: texture {texture} has no device image"
+                                        ),
+                                    );
                                 }
-                                if !backend.clear_color(texture, color, mask) {
-                                    break 'command Status::InternalError;
+                                if let Err(status) = backend.clear_color(texture, color, mask) {
+                                    break 'command status;
                                 }
                                 continue 'commands;
                             }
                             if !presented.contains(&texture) {
                                 continue 'commands;
                             }
-                            // Keep only the first layer of the base level on the
-                            // CPU and only for display-sized images. Large arrays
-                            // and volumes remain on the GPU. SwXBx's own
+                            // Only the first layer of the base level is kept on the
+                            // CPU, and only for sizes a screen can have: a game
+                            // clears large arrays and volumes every frame, and
+                            // copying those on the CPU stalled it. swxbx's own
                             // limit, until clears run on the GPU.
                             let (width, height) =
                                 (description.width.max(1), description.height.max(1));
@@ -263,31 +278,81 @@ pub(crate) fn execute(
                             let _ = stencil;
                             #[cfg(feature = "vulkan")]
                             if let Some(backend) = gpu.as_mut() {
-                                if stencil_mask != 0 {
-                                    break 'command Status::Unimplemented;
-                                }
-                                if depth_write == 0 || depth_target == 0 {
+                                // The clear writes the depth target in the
+                                // format the depth table gives its token, the
+                                // image a draw uses. Source: the public contract.
+                                let reject = |status, reason: std::fmt::Arguments<'_>| {
+                                    crate::unsupported::refuse(
+                                        status,
+                                        format_args!(
+                                            "clear depth-stencil of depth target \
+                                             {depth_target:#x}: {reason}"
+                                        ),
+                                    )
+                                };
+                                let stencil_bits = stencil_mask & 0xff;
+                                if (depth_write == 0 && stencil_bits == 0) || depth_target == 0 {
                                     continue 'commands;
+                                }
+                                if stencil_bits != 0 && stencil_bits != 0xff {
+                                    break 'command reject(
+                                        Status::Unimplemented,
+                                        format_args!(
+                                            "stencil mask {stencil_mask:#x} keeps some stencil \
+                                             bits; swxbx clears all eight or none"
+                                        ),
+                                    );
                                 }
                                 let Some(Object::Texture { description, .. }) =
                                     instance.objects.get(depth_target)
                                 else {
-                                    break 'command Status::BadArgument;
+                                    break 'command reject(
+                                        Status::BadArgument,
+                                        format_args!("it is not a texture"),
+                                    );
                                 };
-                                if !backend.ensure_texture(depth_target, &description, true) {
-                                    break 'command Status::BadArgument;
+                                let format =
+                                    match backend.ensure_depth_clear(depth_target, &description) {
+                                        Ok(format) => format,
+                                        Err((status, why)) => {
+                                            break 'command reject(status, format_args!("{why}"))
+                                        }
+                                    };
+                                if stencil_bits != 0
+                                    && crate::gpu::formats::depth_planes(format)
+                                        .is_none_or(|p| p.stencil == 0)
+                                {
+                                    break 'command reject(
+                                        Status::Unimplemented,
+                                        format_args!(
+                                            "it clears stencil, and {} has none",
+                                            crate::gpu::formats::Name(format)
+                                        ),
+                                    );
                                 }
-                                if !backend.clear_depth(depth_target, depth, 0) {
-                                    break 'command Status::InternalError;
+                                if !backend.clear_depth(
+                                    depth_target,
+                                    (depth_write != 0).then_some(depth),
+                                    (stencil_bits != 0).then_some(stencil & 0xff),
+                                ) {
+                                    break 'command reject(
+                                        Status::InternalError,
+                                        format_args!(
+                                            "the device clear of {} failed",
+                                            crate::gpu::formats::Name(format)
+                                        ),
+                                    );
                                 }
                             }
                         }
                         RecordedCommand::CopyBufferToTexture { buffer, texture } => {
                             // Each rejection names its check, so a run shows
-                            // which one a program's copy fails.
+                            // which one a program's copy fails. Source: the public contract.
                             let reject = |reason: std::fmt::Arguments<'_>| {
-                                eprintln!("swxbx: copy buffer to texture rejected: {reason}");
-                                Status::BadArgument
+                                crate::unsupported::refuse(
+                                    Status::BadArgument,
+                                    format_args!("copy buffer to texture: {reason}"),
+                                )
                             };
                             let Some(Object::Texture { description, .. }) =
                                 instance.objects.get(texture)
@@ -316,6 +381,13 @@ pub(crate) fn execute(
                                             "no image contract rule ({shape})"
                                         ));
                                     };
+                                    if let Err(why) = crate::gpu::formats::supports(
+                                        backend.context(),
+                                        r.descriptor.format,
+                                        crate::gpu::formats::FormatUse::Sampled,
+                                    ) {
+                                        break 'command reject(format_args!("{why} ({shape})"));
+                                    }
                                     r.packing.linear_size()
                                 } else {
                                     let Some(size) = copy_size(&description) else {
@@ -348,7 +420,7 @@ pub(crate) fn execute(
                                     source.offset,
                                     size,
                                 ) {
-                                    break 'command Status::InternalError;
+                                    break 'command crate::unsupported::refuse(Status::InternalError, format_args!("the device could not upload texture {texture} from its memory pool"));
                                 }
                                 continue 'commands;
                             }
@@ -375,7 +447,11 @@ pub(crate) fn execute(
                             if let Some(backend) = gpu.as_mut() {
                                 if let Some(decoder) = &backend.copy_decoder {
                                     let Some(operation) = decoder(arguments) else {
-                                        break 'command Status::Unimplemented;
+                                        break 'command crate::unsupported::refuse(
+                                            Status::BadArgument,
+                                            "copy texture to texture: the installed copy \
+                                             decoder does not describe these arguments",
+                                        );
                                     };
                                     use crate::gpu::image_layout::CopyOperation;
                                     let (src, dst) = match operation {
@@ -394,22 +470,59 @@ pub(crate) fn execute(
                                         let Some(Object::Texture { description, .. }) =
                                             instance.objects.get(texture)
                                         else {
-                                            break 'command Status::BadArgument;
+                                            break 'command crate::unsupported::refuse(
+                                                Status::BadArgument,
+                                                format_args!(
+                                                    "copy texture to texture: {texture:#x} is not \
+                                                     a texture"
+                                                ),
+                                            );
                                         };
-                                        if !backend.ensure_texture(texture, &description, false) {
-                                            break 'command Status::BadArgument;
+                                        if let Err(reason) =
+                                            backend.ensure_copy_texture(texture, &description)
+                                        {
+                                            break 'command crate::unsupported::refuse(
+                                                Status::BadArgument,
+                                                format_args!(
+                                                    "copy texture to texture: texture \
+                                                     {texture:#x} has no image: {reason}"
+                                                ),
+                                            );
                                         }
                                     }
-                                    let ok = match operation {
+                                    match operation {
                                         CopyOperation::Copy { from, to, .. } => {
-                                            backend.copy_region(dst, src, from, to)
+                                            match backend.copy_region(dst, src, from, to) {
+                                                Ok(()) => {}
+                                                Err(crate::gpu::CopyFailure::Refused(reason)) => {
+                                                    break 'command crate::unsupported::refuse(
+                                                        Status::BadArgument,
+                                                        format_args!(
+                                                            "copy texture {src:#x} to \
+                                                             {dst:#x}: {reason}"
+                                                        ),
+                                                    );
+                                                }
+                                                Err(crate::gpu::CopyFailure::Device) => {
+                                                    break 'command crate::unsupported::refuse(Status::InternalError, format_args!("copy texture {src:#x} to {dst:#x}: the device could not record the copy"));
+                                                }
+                                            }
                                         }
                                         CopyOperation::Blit {
                                             from, to, filter, ..
-                                        } => backend.blit_region(dst, src, from, to, filter),
-                                    };
-                                    if !ok {
-                                        break 'command Status::Unimplemented;
+                                        } => {
+                                            if !backend.blit_region(dst, src, from, to, filter) {
+                                                break 'command crate::unsupported::refuse(
+                                                    Status::Unimplemented,
+                                                    format_args!(
+                                                        "blit texture {src:#x} {from:?} to \
+                                                         {dst:#x} {to:?} with filter {}: \
+                                                         swxbx cannot blit these images",
+                                                        filter.as_raw()
+                                                    ),
+                                                );
+                                            }
+                                        }
                                     }
                                     continue 'commands;
                                 }
@@ -417,20 +530,34 @@ pub(crate) fn execute(
                                     let Some(Object::Texture { description, .. }) =
                                         instance.objects.get(texture)
                                     else {
-                                        break 'command Status::BadArgument;
+                                        break 'command crate::unsupported::refuse(
+                                            Status::BadArgument,
+                                            format_args!("copy: object {texture} is not a texture"),
+                                        );
                                     };
-                                    if !backend.ensure_texture(texture, &description, false) {
-                                        break 'command Status::BadArgument;
+                                    if let Err(reason) =
+                                        backend.ensure_copy_texture(texture, &description)
+                                    {
+                                        break 'command crate::unsupported::refuse(
+                                            Status::BadArgument,
+                                            format_args!(
+                                                "copy: texture {texture} has no device image: \
+                                                 {reason}"
+                                            ),
+                                        );
                                     }
                                 }
                                 if !backend.copy(destination, source) {
-                                    break 'command Status::InternalError;
+                                    break 'command crate::unsupported::refuse(Status::InternalError, format_args!("the device could not copy texture {source} to {destination}"));
                                 }
                                 continue 'commands;
                             }
                             let Some(Object::Texture { image, .. }) = instance.objects.get(source)
                             else {
-                                break 'command Status::BadArgument;
+                                break 'command crate::unsupported::refuse(
+                                    Status::BadArgument,
+                                    format_args!("copy: source object {source} is not a texture"),
+                                );
                             };
                             let Some(data) = image
                                 .lock()
@@ -438,7 +565,12 @@ pub(crate) fn execute(
                                 .as_ref()
                                 .map(|i| i.pixels.clone())
                             else {
-                                break 'command Status::BadArgument;
+                                break 'command crate::unsupported::refuse(
+                                    Status::BadArgument,
+                                    format_args!(
+                                        "copy: texture {source} has no pixels kept on the CPU"
+                                    ),
+                                );
                             };
                             copy_cpu(instance, source, destination, data);
                         }
@@ -467,7 +599,7 @@ pub(crate) fn execute(
                                 continue 'commands;
                             }
                             let _ = (primitive, first, count, target_views);
-                            break 'command Status::Unimplemented;
+                            break 'command crate::unsupported::refuse(Status::Unimplemented, "DrawArrays needs the Vulkan device, which this instance does not have");
                         }
                         RecordedCommand::DrawElementsBaseVertex {
                             primitive,
@@ -507,13 +639,19 @@ pub(crate) fn execute(
                                 base_vertex,
                                 target_views,
                             );
-                            break 'command Status::Unimplemented;
+                            break 'command crate::unsupported::refuse(Status::Unimplemented, "DrawElementsBaseVertex needs the Vulkan device, which this instance does not have");
                         }
                         RecordedCommand::Operation { .. }
                         | RecordedCommand::ReportCounter { .. }
                         | RecordedCommand::ResetCounter(_)
                         | RecordedCommand::DrawArraysInstanced { .. } => {
-                            break 'command Status::Unimplemented
+                            break 'command crate::unsupported::refuse(
+                                Status::Unimplemented,
+                                format_args!(
+                                    "{} needs the Vulkan device, which this instance does not have",
+                                    crate::unsupported::command_name(&command)
+                                ),
+                            )
                         }
                         command @ (RecordedCommand::SetViewport(_)
                         | RecordedCommand::SetScissor(_)
@@ -531,10 +669,11 @@ pub(crate) fn execute(
                     }
                     Status::Ok
                 };
-                // Stop ends the batch here, as
-                // records the command and continues.
-                if let Err(status) = instance.unsupported_commands.settle(&command, status) {
-                    return status;
+                // Stop ends the batch here, as the public contract requires. Skip
+                // records the command and continues. Source: the public contract.
+                if let Err(stopped) = instance.unsupported_commands.settle(&command, status) {
+                    instance.batch_stopped(stopped.at);
+                    return stopped.status;
                 }
             }
             instance.objects.recycle_recording(handle, commands);
@@ -689,6 +828,18 @@ pub fn handler(name: &str) -> Option<Handler> {
             };
             #[cfg(not(feature = "vulkan"))]
             let _ = &description;
+            // The commands before this present have run (the call waited
+            // for them). If one of their batches stopped, the frame lacks
+            // the rest of that batch: nothing is presented, and the window
+            // keeps the last frame it was given.
+            if let Some(stopped) = instance.take_stopped_batch() {
+                return crate::unsupported::refuse(
+                    Status::Unimplemented,
+                    format!(
+                        "window {window:#x}: not presented, because a batch submitted since the last present stopped at {stopped}"
+                    ),
+                );
+            }
             let Some(host) = instance.host() else {
                 r.x[0] = 0;
                 return Status::Ok;
@@ -719,9 +870,20 @@ pub fn handler(name: &str) -> Option<Handler> {
                         return Err(Status::BadArgument);
                     }
                     if !host.vulkan.is_null() {
-                        let handed = backend
-                            .present_window(host, window, texture, present_interval, pacing.config)
-                            .ok_or(Status::InternalError)?;
+                        let scaling = host.scaling(window).map_err(|why| {
+                            crate::unsupported::refuse(
+                                Status::BadArgument,
+                                format!("window {window:#x}: {why}"),
+                            )
+                        })?;
+                        let handed = backend.present_window(
+                            host,
+                            window,
+                            texture,
+                            present_interval,
+                            scaling,
+                            pacing.config,
+                        )?;
                         if handed {
                             pacing.delivered(started);
                         } else {
@@ -735,6 +897,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                             .ok_or(Status::InternalError)?;
                         pacing.push(crate::presentation::Frame {
                             window,
+                            interval: present_interval,
                             started,
                             slot,
                             pixels: None,
@@ -742,7 +905,6 @@ pub fn handler(name: &str) -> Option<Handler> {
                     }
                     return Ok(());
                 }
-                let _ = present_interval;
                 if !host.vulkan.is_null() {
                     return Err(Status::InternalError);
                 }
@@ -755,6 +917,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                         .ok_or(Status::BadArgument)?;
                     pacing.push(crate::presentation::Frame {
                         window,
+                        interval: present_interval,
                         started,
                         slot,
                         pixels: Some((image.width, image.height, image.pixels)),
@@ -769,7 +932,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             r.x[0] = 0;
             Status::Ok
         },
-        // Report success because this path has no pending host signal to wait for.
+        // Observed to return 1. Waiting on a sync that nothing signals would
+        // block the program forever, so the wait is reported as satisfied.
         "nvnQueueWaitSync" => |_instance, _, registers| succeed(registers),
         "nvnSyncInitialize" => |instance, _, registers| {
             instance.objects.put(
@@ -784,7 +948,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             instance.objects.remove(registers.x[0]);
             Status::Ok
         },
-        // Report a completed wait.
+        // Observed to return 0, taken to mean the wait completed.
         "nvnSyncWait" => accept,
         "nvnEventBuilderSetStorage" => |instance, _, registers| {
             instance.objects.put(
@@ -796,8 +960,9 @@ pub fn handler(name: &str) -> Option<Handler> {
             );
             Status::Ok
         },
-        // The event lives in the pool memory selected by EventBuilderSetStorage.
-        // Keep the stored value synchronized with the event state.
+        // The event lives in pool memory the program chose
+        // (EventBuilderSetStorage), and the program was seen reading that
+        // memory directly rather than calling EventGetValue (note 0011).
         "nvnEventInitialize" => |instance, _, registers| {
             let storage = match instance.objects.get(registers.x[1]) {
                 Some(Object::EventBuilder { pool, offset }) => match instance.objects.get(pool) {
@@ -818,7 +983,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             };
             Status::Ok
         },
-        // Mark the event as signaled.
+        // Signatures 0003 leaves the arguments open. The event is marked
+        // signalled, which is the least the name promises.
         "nvnEventSignal" => |instance, _, registers| {
             signal_event(instance, registers.x[0], 1);
             Status::Ok
@@ -830,6 +996,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                     device: 0,
                     native_window: 0,
                     textures: Vec::new(),
+                    present_interval: crate::presentation::PresentInterval::ONE,
                 },
             );
             Status::Ok
@@ -851,7 +1018,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             })
         },
         "nvnWindowBuilderSetTextures" => |instance, _, registers| {
-            // An array of `count` texture object addresses.
+            // An array of `count` texture object addresses (signatures 0004).
             let count = registers.x[1].min(16);
             let mut list = Vec::with_capacity(count as usize);
             for index in 0..count {
@@ -866,15 +1033,63 @@ pub fn handler(name: &str) -> Option<Handler> {
                 }
             })
         },
+        // Read once where it arrives; whether this host and mode can show it
+        // is asked when the window initializes. Source: the public contract.
+        "nvnWindowBuilderSetPresentInterval" => |instance, _, registers| {
+            let builder = registers.x[0];
+            let interval = match crate::presentation::PresentInterval::from_guest(
+                registers.x[1] as u32 as i32,
+            ) {
+                Ok(interval) => interval,
+                Err(why) => {
+                    return crate::unsupported::refuse(
+                        Status::BadArgument,
+                        format!("window builder {builder:#x}: {why}"),
+                    )
+                }
+            };
+            builder_update(instance, registers, |object| {
+                if let Object::WindowBuilder {
+                    present_interval, ..
+                } = object
+                {
+                    *present_interval = interval;
+                }
+            })
+        },
+        "nvnWindowBuilderGetPresentInterval" => |instance, _, registers| {
+            registers.x[0] = match instance.objects.get(registers.x[0]) {
+                Some(Object::WindowBuilder {
+                    present_interval, ..
+                }) => u64::from(present_interval.guest_value()),
+                _ => 1,
+            };
+            Status::Ok
+        },
         "nvnWindowInitialize" => |instance, _, registers| {
             let Some(Object::WindowBuilder {
                 device,
                 textures,
                 native_window,
+                present_interval,
             }) = instance.objects.get(registers.x[1])
             else {
                 return Status::BadArgument;
             };
+            // Held so the policy cannot change between the checks below and
+            // the opened window. Source: the public contract. and 0064.
+            let pacing = instance
+                .presentation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Err(why) = present_interval.shown_by(instance.host(), pacing.config.mode) {
+                let window = registers.x[0];
+                registers.x[0] = 0;
+                return crate::unsupported::refuse(
+                    Status::BadArgument,
+                    format!("window {window:#x}: {why}"),
+                );
+            }
             #[cfg(feature = "vulkan")]
             if let Some(host) = instance.host() {
                 if !host.vulkan.is_null() {
@@ -883,12 +1098,18 @@ pub fn handler(name: &str) -> Option<Handler> {
                         registers.x[0] = 0;
                         return Status::InternalError;
                     };
-                    if backend
-                        .open_window(host, registers.x[0], native_window)
-                        .is_none()
-                    {
+                    let window = registers.x[0];
+                    if backend.open_window(host, window, native_window).is_none() {
                         registers.x[0] = 0;
                         return Status::InternalError;
+                    }
+                    let mode = pacing.config.mode;
+                    if mode == crate::PresentationMode::Mailbox {
+                        if let Err(why) = backend.window_takes(window, mode) {
+                            backend.close_window(window);
+                            registers.x[0] = 0;
+                            return crate::presentation::refuse_unoffered(mode, window, why);
+                        }
                     }
                 }
             }
@@ -903,7 +1124,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                 Object::Window {
                     device,
                     textures,
-                    present_interval: 1,
+                    present_interval,
                     next_texture: 0,
                 },
             );
@@ -926,14 +1147,39 @@ pub fn handler(name: &str) -> Option<Handler> {
             instance.objects.remove(registers.x[0]);
             Status::Ok
         },
+        // The interval is honoured at every present or refused here, by name,
+        // when this host and presentation mode cannot show it. Source: the public contract.
         "nvnWindowSetPresentInterval" => |instance, _, registers| {
-            let value = registers.x[1] as u32;
+            let window = registers.x[0];
+            let interval = match crate::presentation::PresentInterval::from_guest(
+                registers.x[1] as u32 as i32,
+            ) {
+                Ok(interval) => interval,
+                Err(why) => {
+                    return crate::unsupported::refuse(
+                        Status::BadArgument,
+                        format!("window {window:#x}: {why}"),
+                    )
+                }
+            };
+            // Held across the update so the mode cannot change between the
+            // check and the stored interval.
+            let pacing = instance
+                .presentation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Err(why) = interval.shown_by(instance.host(), pacing.config.mode) {
+                return crate::unsupported::refuse(
+                    Status::BadArgument,
+                    format!("window {window:#x}: {why}"),
+                );
+            }
             builder_update(instance, registers, |object| {
                 if let Object::Window {
                     present_interval, ..
                 } = object
                 {
-                    *present_interval = value;
+                    *present_interval = interval;
                 }
             })
         },
@@ -941,13 +1187,14 @@ pub fn handler(name: &str) -> Option<Handler> {
             registers.x[0] = match instance.objects.get(registers.x[0]) {
                 Some(Object::Window {
                     present_interval, ..
-                }) => u64::from(present_interval),
+                }) => u64::from(present_interval.guest_value()),
                 _ => 1,
             };
             Status::Ok
         },
-        // Hand out the window textures in turn and write the selected index
-        // through the third argument.
+        // Hands out the window's textures in turn and writes the index
+        // through the third argument (signatures 0004); returns 0 as
+        // observed.
         "nvnWindowAcquireTexture" => |instance, _, registers| {
             let mut index = 0;
             let found = instance.objects.update(registers.x[0], |object| {

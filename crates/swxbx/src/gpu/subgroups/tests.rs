@@ -279,7 +279,7 @@ fn fragment_votes_ballots_shuffles_and_masks_read_back_exactly() {
     let mut outputs = Vec::new();
     for required in [false, true, false, true] {
         let state = DrawPipelineState {
-            subgroup_size_32: [false, required],
+            subgroup_size_32: [false, required, false],
             ..Default::default()
         };
         if required {
@@ -293,6 +293,7 @@ fn fragment_votes_ballots_shuffles_and_masks_read_back_exactly() {
                     requires_demote_to_helper_invocation: false,
                     requires_maximal_reconvergence: false,
                     surfaces: Vec::new(),
+                    textures: Vec::new(),
                 })
                 .collect();
             let recipe = PipelineRecipe {

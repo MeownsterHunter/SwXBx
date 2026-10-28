@@ -1,4 +1,5 @@
-//! Storage-image (surface) bindings a translated module declares.
+//! Storage-image (surface) bindings a translated module declares, and the
+//! bindless sampled textures it declares.
 //!
 //! A translator that emits storage images reports each view it declared:
 //! where the module expects it (descriptor set and binding), which guest
@@ -8,8 +9,12 @@
 //! dispatch time. The values are the translator's own; the adapter parses
 //! them once at its edge into these types.
 //!
-//! Surface targets and raw access sizes are normalized into typed image
-//! dimensions and formats at this boundary.
+//! The mapping of Maxwell surface targets and raw access sizes to image
+//! dimensions and formats follows the reference host (MIT):
+//! `Shader/Decoders/InstDecoders.cs` (`SuDim`, `SuSize`),
+//! `Shader/Instructions/InstEmitSurface.cs` (raw formats) and
+//! `Shader/CodeGen/Spirv/Declarations.cs` (storage image declarations).
+//! Copyright (c) the reference host Team and Contributors, MIT licensed.
 
 /// One storage-image view a translated module declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,6 +42,21 @@ pub enum SurfaceSource {
     },
     /// A handle the module computes from constants and constant buffers.
     Bindless(BindlessHandle),
+}
+
+/// A sampled texture whose handle the translated module computes from
+/// constants and constant-buffer words: the module samples its texture at
+/// binding `image` and its sampler at binding `sampler`, both in `set`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BindlessTexture {
+    /// Descriptor set number in the translated module.
+    pub set: u32,
+    /// Sampled-image descriptor binding number in the translated module.
+    pub image: u32,
+    /// Separate sampler descriptor binding number in the translated module.
+    pub sampler: u32,
+    /// The handle the module computes.
+    pub source: BindlessHandle,
 }
 
 /// A bindless handle: one word, or two words combined.

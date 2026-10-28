@@ -1,4 +1,4 @@
-//! Strict validation failure checks against a live messenger.
+//! Strict validation failure checks against a live messenger. Source: the public contract.
 #![cfg(feature = "vulkan")]
 
 use ash::vk;

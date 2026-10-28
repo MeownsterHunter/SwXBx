@@ -1,4 +1,4 @@
-//! Explicit host interpretations of opaque texture fields.
+//! Explicit host interpretations of opaque texture fields. Source: the public contract.; 0032.
 use super::image_enums::{validate_rules, EnumRule, Evidence};
 use crate::{
     api::TextureDescription,
@@ -6,6 +6,20 @@ use crate::{
 };
 use ash::vk;
 use std::collections::HashSet;
+
+/// How a texture's sample coordinates address it. NVN's RECTANGLE target
+/// reads texels, in [0, extent]; every other target reads [0, 1]. The guest
+/// driver clears the descriptor's normalized-coordinates bit for rectangle
+/// textures (the reference host Gpu/Image/TextureDescriptor.cs:203-208), so a shader
+/// that samples one is translated for texel coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Coordinates {
+    /// [0, 1] across the texture.
+    #[default]
+    Normalized,
+    /// [0, extent] in texels of level zero. Two-dimensional images only.
+    Texels,
+}
 
 /// Storage selected by a host after interpreting recorded builder fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +47,9 @@ pub struct ImageRule {
     pub host_format: vk::Format,
     /// Image dimension and layer organization.
     pub kind: ImageKind,
+    /// How shaders address the texture: the rule for an NVN RECTANGLE
+    /// target token says Texels.
+    pub coordinates: Coordinates,
     /// Base address of host-managed program storage.
     pub storage: Storage,
 }
@@ -42,7 +59,7 @@ pub struct ImageRule {
 pub struct ImageContract {
     /// Unique flags, target, and format rules; no implicit mapping is added.
     pub rules: Vec<ImageRule>,
-    /// Empty uses the host identity choice. Nonempty requires every token.
+    /// Empty retains the legacy host identity choice. Nonempty requires every token.
     pub swizzles: Vec<EnumRule<vk::ComponentSwizzle>>,
     /// Explicit caller selectors mapped to one depth or stencil aspect.
     pub depth_stencil_modes: Vec<EnumRule<vk::ImageAspectFlags>>,
@@ -99,6 +116,12 @@ impl ImageContract {
             {
                 return Err("duplicate image rule or unsupported format geometry".into());
             }
+            if r.coordinates == Coordinates::Texels && r.kind != ImageKind::D2 {
+                return Err(format!(
+                    "image rule for target {} reads texel coordinates but is not two-dimensional",
+                    r.target
+                ));
+            }
             if let Storage::Tiled(t) = r.storage {
                 if t.height_log2 > 5 || t.depth_log2 > 5 {
                     return Err("image tile exponent exceeds five".into());
@@ -107,6 +130,15 @@ impl ImageContract {
         }
         Ok(())
     }
+    /// How shaders address a texture with this description, or None when
+    /// no rule covers it.
+    pub(crate) fn coordinates(&self, d: &TextureDescription) -> Option<Coordinates> {
+        self.rules
+            .iter()
+            .find(|r| (r.flags, r.target, r.format) == (d.flags, d.target, d.format))
+            .map(|r| r.coordinates)
+    }
+
     pub(crate) fn resolve(&self, d: &TextureDescription) -> Option<ResolvedImage> {
         let r = self
             .rules
@@ -234,6 +266,8 @@ pub fn format_block(format: vk::Format) -> Option<BlockFormat> {
         | F::B10G11R11_UFLOAT_PACK32
         | F::E5B9G9R9_UFLOAT_PACK32
         | F::X8_D24_UNORM_PACK32 => 4,
+        F::D16_UNORM_S8_UINT | F::D24_UNORM_S8_UINT => 4,
+        F::D32_SFLOAT_S8_UINT => 8,
         F::R16G16B16A16_UNORM
         | F::R16G16B16A16_SNORM
         | F::R16G16B16A16_UINT
@@ -381,7 +415,8 @@ pub enum NumericClass {
     /// Depth samples represented as floating-point values.
     Depth,
 }
-/// Classify supported integer and depth formats; other formats use float samples.
+/// Classify integer and depth formats; other formats use float samples.
+/// Every 8-, 16- and 32-bit-component `_UINT` and `_SINT` colour format is listed.
 pub fn numeric_class(format: vk::Format) -> NumericClass {
     use vk::Format as F;
     match format {
@@ -396,7 +431,13 @@ pub fn numeric_class(format: vk::Format) -> NumericClass {
         | F::R16G16B16A16_UINT
         | F::R32_UINT
         | F::R32G32_UINT
-        | F::R32G32B32A32_UINT => NumericClass::Unsigned,
+        | F::R32G32B32A32_UINT
+        | F::R8G8B8_UINT
+        | F::B8G8R8_UINT
+        | F::B8G8R8A8_UINT
+        | F::A8B8G8R8_UINT_PACK32
+        | F::R16G16B16_UINT
+        | F::R32G32B32_UINT => NumericClass::Unsigned,
         F::R8_SINT
         | F::R8G8_SINT
         | F::R8G8B8A8_SINT
@@ -405,7 +446,15 @@ pub fn numeric_class(format: vk::Format) -> NumericClass {
         | F::R16G16B16A16_SINT
         | F::R32_SINT
         | F::R32G32_SINT
-        | F::R32G32B32A32_SINT => NumericClass::Signed,
+        | F::R32G32B32A32_SINT
+        | F::R8G8B8_SINT
+        | F::B8G8R8_SINT
+        | F::B8G8R8A8_SINT
+        | F::A8B8G8R8_SINT_PACK32
+        | F::A2R10G10B10_SINT_PACK32
+        | F::A2B10G10R10_SINT_PACK32
+        | F::R16G16B16_SINT
+        | F::R32G32B32_SINT => NumericClass::Signed,
         F::D16_UNORM
         | F::X8_D24_UNORM_PACK32
         | F::D32_SFLOAT
@@ -421,6 +470,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_depth_stencil_formats_have_copy_geometry() {
+        assert_eq!(
+            format_block(vk::Format::D16_UNORM_S8_UINT).unwrap().bytes,
+            4
+        );
+        assert_eq!(
+            format_block(vk::Format::D24_UNORM_S8_UINT).unwrap().bytes,
+            4
+        );
+        assert_eq!(
+            format_block(vk::Format::D32_SFLOAT_S8_UINT).unwrap().bytes,
+            8
+        );
+    }
+
+    #[test]
     fn opaque_builder_fields_need_an_exact_rule() {
         let rule = ImageRule {
             evidence: [crate::gpu::image_enums::Evidence::Hypothesis; 3],
@@ -430,6 +495,7 @@ mod tests {
             format: 23,
             host_format: vk::Format::BC1_RGBA_UNORM_BLOCK,
             kind: ImageKind::D2Array,
+            coordinates: Coordinates::Normalized,
             storage: Storage::Tiled(TileShape {
                 height_log2: 3,
                 depth_log2: 0,

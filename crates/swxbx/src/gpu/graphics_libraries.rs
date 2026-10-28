@@ -1,4 +1,4 @@
-//! Shared graphics subsets and bounded compilation.
+//! Shared graphics subsets and bounded compilation. Evidence: the public contract and 0038.
 use super::{
     graphics::{DrawPipelineState, GraphicsPipeline, Key, PrimitiveTopology, VertexInput},
     graphics_modules::ShaderModules,
@@ -37,7 +37,7 @@ impl Part {
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PartKey {
     part: Part,
-    shader: Vec<u32>,
+    shader: Vec<Vec<u32>>,
     input: Option<VertexInput>,
     topology: Option<PrimitiveTopology>,
     state: DrawPipelineState,
@@ -46,7 +46,7 @@ struct PartKey {
 }
 impl PartKey {
     fn new(key: &Key, part: Part) -> Result<Self, String> {
-        use super::uniforms::{self, UniformStage};
+        use super::uniforms::{self, GraphicsStage};
         let mut result = Self {
             part,
             shader: Vec::new(),
@@ -66,15 +66,14 @@ impl PartKey {
                 result.storage = key.storage;
                 result.state.color_count = key.state.color_count.max(1);
                 result.state.attachment = key.state.attachment;
-                for (words, stage) in [
-                    (&key.vertex, UniformStage::Vertex),
-                    (&key.fragment, UniformStage::Fragment),
-                ] {
+                result.state.color_formats = key.state.color_formats;
+                result.state.depth_format = key.state.depth_format;
+                for (stage, words) in key.stages.iter() {
                     result
                         .layout
                         .extend(uniforms::banks(words, stage)?.into_iter().map(|b| {
                             (
-                                b.stage.set(),
+                                b.stage.bank_set(),
                                 b.bank,
                                 if key.storage {
                                     vk::DescriptorType::STORAGE_BUFFER
@@ -91,16 +90,23 @@ impl PartKey {
                     );
                 }
                 result.layout.sort_unstable();
+                // The pre-rasterization part holds the vertex and geometry
+                // stages; the fragment part holds the fragment stage.
+                let in_part = |stage: GraphicsStage| match stage {
+                    GraphicsStage::Vertex | GraphicsStage::Geometry => part == Part::Raster,
+                    GraphicsStage::Fragment => part == Part::Fragment,
+                };
+                for (stage, words) in key.stages.iter().filter(|&(stage, _)| in_part(stage)) {
+                    result.state.subgroup_size_32[stage.slot()] =
+                        key.state.subgroup_size_32[stage.slot()];
+                    result.shader.push(words.to_vec());
+                }
                 if part == Part::Raster {
-                    result.state.subgroup_size_32[0] = key.state.subgroup_size_32[0];
-                    result.shader = key.vertex.clone();
                     result.state.cull = key.state.cull;
                     result.state.polygon = key.state.polygon;
                     result.state.clockwise = key.state.clockwise;
                     result.state.bias = key.state.bias;
                 } else {
-                    result.state.subgroup_size_32[1] = key.state.subgroup_size_32[1];
-                    result.shader = key.fragment.clone();
                     result.state.depth_test = key.state.depth_test;
                     result.state.depth_write = key.state.depth_write;
                     result.state.depth_compare = key.state.depth_compare;
@@ -111,6 +117,8 @@ impl PartKey {
             Part::Output => {
                 result.state.color_count = key.state.color_count.max(1);
                 result.state.attachment = key.state.attachment;
+                result.state.color_formats = key.state.color_formats;
+                result.state.depth_format = key.state.depth_format;
                 result.state.colors[..result.state.color_count as usize]
                     .copy_from_slice(&key.state.colors[..result.state.color_count as usize]);
             }
@@ -401,8 +409,7 @@ impl Compiler {
 fn common_jobs() -> Vec<Job> {
     use super::graphics::{VertexAttribute, VertexBinding, VertexFormat};
     let mut key = Key {
-        vertex: Vec::new(),
-        fragment: Vec::new(),
+        stages: super::graphics::GraphicsStages::fixed(),
         input: VertexInput {
             bindings: vec![VertexBinding {
                 binding: 0,
@@ -500,10 +507,14 @@ mod tests {
     fn keys_separate_shader_input_raster_depth_and_output_changes() {
         let a = key();
         let mut b = a.clone();
-        b.fragment.extend([2 << 16, 42]);
+        b.stages
+            .words_mut(super::super::uniforms::GraphicsStage::Fragment)
+            .extend([2 << 16, 42]);
         assert!(changed_parts(&a, &b) == [Part::Fragment]);
         b = a.clone();
-        b.vertex.extend([2 << 16, 42]);
+        b.stages
+            .words_mut(super::super::uniforms::GraphicsStage::Vertex)
+            .extend([2 << 16, 42]);
         assert!(changed_parts(&a, &b) == [Part::Raster]);
         b = a.clone();
         b.input.bindings[0].stride = 32;

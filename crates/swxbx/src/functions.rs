@@ -1,8 +1,10 @@
 //! The functions a program can request by name.
 //!
 //! The list is data, not code: `data/function-names.txt` holds one name per
-//! line, sorted. A function's id is its position in that list, so ids are
-//! stable for one host interface version.
+//! line, sorted. Where it comes from is recorded in
+//! `the documented contract`. A function's id is its position
+//! in that list, so ids are stable for as long as the list only grows at a
+//! new host interface version.
 
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -74,7 +76,7 @@ mod tests {
 
     #[test]
     fn the_list_has_the_recorded_number_of_names() {
-        // The function table and the public count must remain synchronized.
+        // The count stated in the documented contract
         assert_eq!(count(), 534);
     }
 

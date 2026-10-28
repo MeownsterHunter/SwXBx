@@ -1,12 +1,29 @@
-//! Window surface, swapchain and presentation.
+//! Window surface, swapchain and presentation. Source: the public contract. and 0034.
 
 use super::{
     commands::Commands,
-    images::{can_blit, record_present, ImageInfo},
+    images::{can_blit, record_present, ImageInfo, Placement},
     Context,
 };
 use ash::vk;
 use std::{collections::VecDeque, sync::Arc};
+
+/// The surface present mode a requested presentation mode needs.
+fn present_mode(mode: crate::PresentationMode) -> vk::PresentModeKHR {
+    match mode {
+        crate::PresentationMode::Fifo => vk::PresentModeKHR::FIFO,
+        crate::PresentationMode::Mailbox => vk::PresentModeKHR::MAILBOX,
+    }
+}
+
+/// Why a surface cannot take a presentation mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unoffered {
+    /// The surface answered and the mode is not among its modes.
+    Lacks,
+    /// The surface could not be asked which modes it offers.
+    CannotBeAsked,
+}
 
 struct Swapchain {
     context: Arc<Context>,
@@ -19,6 +36,7 @@ struct Swapchain {
     retired: Vec<vk::Fence>,
     presented: Vec<bool>,
     in_flight: VecDeque<usize>,
+    opaque: Option<OpaquePass>,
 }
 
 impl Drop for Swapchain {
@@ -39,8 +57,252 @@ impl Drop for Swapchain {
             for &semaphore in &self.ready {
                 self.context.device.destroy_semaphore(semaphore, None);
             }
+            if let Some(opaque) = self.opaque.as_mut() {
+                opaque.destroy();
+            }
             self.loader.destroy_swapchain(self.handle, None);
         }
+    }
+}
+
+struct OpaquePass {
+    context: Arc<Context>,
+    render_pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    premultiply: vk::Pipeline,
+    opaque: vk::Pipeline,
+    views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+}
+
+fn opaque_blend_attachments() -> [vk::PipelineColorBlendAttachmentState; 2] {
+    let rgb = vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B;
+    [
+        vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ZERO)
+            .dst_color_blend_factor(vk::BlendFactor::DST_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(rgb),
+        vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(vk::ColorComponentFlags::A),
+    ]
+}
+
+impl OpaquePass {
+    fn new(context: &Arc<Context>, format: vk::Format, images: &[ImageInfo]) -> Option<Self> {
+        let attachment = vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        let reference = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let references = [reference];
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&references);
+        let attachments = [attachment];
+        let subpasses = [subpass];
+        let render_pass = unsafe {
+            context
+                .device
+                .create_render_pass(
+                    &vk::RenderPassCreateInfo::default()
+                        .attachments(&attachments)
+                        .subpasses(&subpasses),
+                    None,
+                )
+                .ok()?
+        };
+        let layout = unsafe {
+            context
+                .device
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+                .ok()?
+        };
+        let words = |bytes: &[u8]| {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect::<Vec<_>>()
+        };
+        let vertex = context
+            .create_global_shader_module(&words(include_bytes!("present_alpha.vert.spv")))
+            .ok()?;
+        let fragment = context
+            .create_global_shader_module(&words(include_bytes!("present_alpha.frag.spv")))
+            .ok()?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment)
+                .name(c"main"),
+        ];
+        let input = vk::PipelineVertexInputStateCreateInfo::default();
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        // Preserve the destination alpha while premultiplying RGB, then replace
+        // alpha in a separate draw. Keeping those writes separate makes the
+        // destination-alpha dependency explicit on every Vulkan implementation.
+        let create = |attachment: vk::PipelineColorBlendAttachmentState| {
+            let attachments = [attachment];
+            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+            let info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&input)
+                .input_assembly_state(&assembly)
+                .viewport_state(&viewport)
+                .rasterization_state(&raster)
+                .multisample_state(&multisample)
+                .color_blend_state(&blend)
+                .dynamic_state(&dynamic)
+                .layout(layout)
+                .render_pass(render_pass);
+            unsafe {
+                context
+                    .device
+                    .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                    .ok()
+                    .map(|pipelines| pipelines[0])
+            }
+        };
+        let [premultiply_state, opaque_state] = opaque_blend_attachments();
+        let premultiply = create(premultiply_state)?;
+        let opaque = match create(opaque_state) {
+            Some(pipeline) => pipeline,
+            None => {
+                unsafe { context.device.destroy_pipeline(premultiply, None) };
+                return None;
+            }
+        };
+        unsafe {
+            context.device.destroy_shader_module(vertex, None);
+            context.device.destroy_shader_module(fragment, None);
+        }
+        let mut views = Vec::with_capacity(images.len());
+        let mut framebuffers = Vec::with_capacity(images.len());
+        for image in images {
+            let view = unsafe {
+                context
+                    .device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image.image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .level_count(1)
+                                    .layer_count(1),
+                            ),
+                        None,
+                    )
+                    .ok()?
+            };
+            let framebuffer_attachments = [view];
+            let framebuffer = unsafe {
+                context
+                    .device
+                    .create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(render_pass)
+                            .attachments(&framebuffer_attachments)
+                            .width(image.extent.width)
+                            .height(image.extent.height)
+                            .layers(1),
+                        None,
+                    )
+                    .ok()?
+            };
+            views.push(view);
+            framebuffers.push(framebuffer);
+        }
+        Some(Self {
+            context: Arc::clone(context),
+            render_pass,
+            layout,
+            premultiply,
+            opaque,
+            views,
+            framebuffers,
+        })
+    }
+
+    fn record(&self, command: vk::CommandBuffer, index: usize, extent: vk::Extent2D) {
+        let area = vk::Rect2D::default().extent(extent);
+        let recorder = self.context.recorder();
+        unsafe {
+            recorder.cmd_begin_render_pass(
+                command,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(self.render_pass)
+                    .framebuffer(self.framebuffers[index])
+                    .render_area(area),
+                vk::SubpassContents::INLINE,
+            );
+            recorder.cmd_set_viewport(
+                command,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            recorder.cmd_set_scissor(command, &[area]);
+            recorder.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, self.premultiply);
+            recorder.cmd_draw(command, 3, 1, 0, 0);
+            recorder.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, self.opaque);
+            recorder.cmd_draw(command, 3, 1, 0, 0);
+            recorder.cmd_end_render_pass(command);
+        }
+    }
+
+    unsafe fn destroy(&mut self) {
+        for framebuffer in self.framebuffers.drain(..) {
+            self.context.device.destroy_framebuffer(framebuffer, None);
+        }
+        for view in self.views.drain(..) {
+            self.context.device.destroy_image_view(view, None);
+        }
+        self.context.device.destroy_pipeline(self.premultiply, None);
+        self.context.device.destroy_pipeline(self.opaque, None);
+        self.context
+            .device
+            .destroy_pipeline_layout(self.layout, None);
+        self.context
+            .device
+            .destroy_render_pass(self.render_pass, None);
     }
 }
 
@@ -86,8 +348,55 @@ impl Window {
         Some(window)
     }
 
+    /// Ask this surface whether it offers the requested mode.
+    pub fn offers(&self, mode: crate::PresentationMode) -> Result<(), Unoffered> {
+        let modes = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(
+                    self.context.physical_device,
+                    self.surface,
+                )
+                .map_err(|_| Unoffered::CannotBeAsked)?
+        };
+        if modes.contains(&present_mode(mode)) {
+            Ok(())
+        } else {
+            Err(Unoffered::Lacks)
+        }
+    }
+
     pub fn wait(&self) -> bool {
         self.commands.as_ref().is_none_or(|c| c.wait().is_some())
+    }
+
+    /// Check that a texture of `format` can be blitted into this window's
+    /// swapchain images, or say why not. Before the first present the
+    /// swapchain format is the one the surface would be given. Source: the public contract.
+    pub fn blits_from(&self, format: vk::Format) -> Result<(), String> {
+        let target = match self.chain.as_ref().and_then(|c| c.images.first()) {
+            Some(image) => image.format,
+            None => {
+                let formats = unsafe {
+                    self.surface_loader.get_physical_device_surface_formats(
+                        self.context.physical_device,
+                        self.surface,
+                    )
+                }
+                .map_err(|e| format!("its surface formats cannot be asked: {e:?}"))?;
+                choose_format(&self.context, &formats)
+                    .ok_or("its surface offers no format swxbx can blit into")?
+                    .format
+            }
+        };
+        if can_blit(&self.context, format, target) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the device cannot blit {} into the window's {} images",
+                super::formats::Name(format),
+                super::formats::Name(target)
+            ))
+        }
     }
 
     fn configure(&mut self, desired: vk::Extent2D, mode: crate::PresentationMode) -> Option<bool> {
@@ -119,18 +428,9 @@ impl Window {
         if extent.width == 0 || extent.height == 0 {
             return Some(false);
         }
-        let modes = unsafe {
-            self.surface_loader
-                .get_physical_device_surface_present_modes(context.physical_device, self.surface)
-                .ok()?
-        };
-        let mode = if mode == crate::PresentationMode::Mailbox
-            && modes.contains(&vk::PresentModeKHR::MAILBOX)
-        {
-            vk::PresentModeKHR::MAILBOX
-        } else {
-            vk::PresentModeKHR::FIFO
-        };
+        // The mode was asked of this surface when the policy was set or the
+        // window opened, whichever came last.
+        let mode = present_mode(mode);
         if !self.rebuild
             && self
                 .chain
@@ -139,10 +439,9 @@ impl Window {
         {
             return Some(true);
         }
-        if !caps
-            .supported_usage_flags
-            .contains(vk::ImageUsageFlags::TRANSFER_DST)
-        {
+        let required_usage =
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if !caps.supported_usage_flags.contains(required_usage) {
             return None;
         }
         let formats = unsafe {
@@ -171,7 +470,7 @@ impl Window {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+            .image_usage(required_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(alpha)
@@ -185,6 +484,14 @@ impl Window {
         self.commands.as_ref()?.wait()?;
         self.chain.take();
         let loader = ash::khr::swapchain::Device::new(&context.instance, &context.device);
+        if std::env::var_os("SWXBX_PRESENT_TRACE").is_some() {
+            eprintln!(
+                "swxbx present: swapchain extent={}x{} desired={}x{} caps_current={}x{} format={:?}/{:?} alpha={:?} supported_alpha={:?} mode={:?} images={}",
+                extent.width, extent.height, desired.width, desired.height,
+                caps.current_extent.width, caps.current_extent.height,
+                format.format.as_raw(), format.color_space.as_raw(), alpha.as_raw(), caps.supported_composite_alpha.as_raw(), mode.as_raw(), count
+            );
+        }
         let handle = unsafe { loader.create_swapchain(&info, None).ok()? };
         let mut chain = Swapchain {
             context: Arc::clone(context),
@@ -197,6 +504,7 @@ impl Window {
             retired: Vec::new(),
             presented: Vec::new(),
             in_flight: VecDeque::new(),
+            opaque: None,
         };
         chain.images = unsafe { chain.loader.get_swapchain_images(handle).ok()? }
             .into_iter()
@@ -220,6 +528,7 @@ impl Window {
                 size: u64::from(extent.width) * u64::from(extent.height) * 4,
             })
             .collect();
+        chain.opaque = Some(OpaquePass::new(context, format.format, &chain.images)?);
         for _ in &chain.images {
             chain.retired.push(unsafe {
                 context
@@ -245,6 +554,7 @@ impl Window {
         &mut self,
         source: ImageInfo,
         desired: vk::Extent2D,
+        scaling: crate::Scaling,
         config: crate::PresentationConfig,
     ) -> Option<bool> {
         if self.failed {
@@ -294,8 +604,13 @@ impl Window {
                     cmd,
                     source,
                     target,
-                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    Placement::of(scaling, target.extent),
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
+                chain
+                    .opaque
+                    .as_ref()?
+                    .record(cmd, index as usize, chain.extent);
                 let ready = chain.ready[index as usize];
                 commands.submit(true, Some(ready))?;
                 chain.images[index as usize].layout = vk::ImageLayout::PRESENT_SRC_KHR;
@@ -357,7 +672,9 @@ fn choose_format(
         vk::Format::B8G8R8A8_SRGB,
         vk::Format::R8G8B8A8_SRGB,
     ] {
-        if !can_blit(context, vk::Format::R8G8B8A8_UNORM, format) {
+        let required =
+            vk::FormatFeatureFlags::BLIT_DST | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        if !super::formats::optimal_features(context, format).contains(required) {
             continue;
         }
         if let Some(surface_format) = formats.iter().find(|f| {
@@ -380,5 +697,22 @@ impl Drop for Window {
         unsafe {
             self.surface_loader.destroy_surface(self.surface, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_present_premultiplies_before_replacing_alpha() {
+        let [premultiply, opaque] = opaque_blend_attachments();
+        let rgb =
+            vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B;
+        assert!(premultiply.color_write_mask == rgb);
+        assert!(premultiply.dst_color_blend_factor == vk::BlendFactor::DST_ALPHA);
+        assert!(premultiply.src_color_blend_factor == vk::BlendFactor::ZERO);
+        assert!(opaque.color_write_mask == vk::ColorComponentFlags::A);
+        assert_eq!(opaque.blend_enable, vk::FALSE);
     }
 }

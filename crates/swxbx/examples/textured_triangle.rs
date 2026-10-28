@@ -1,4 +1,4 @@
-//! Draw a checkerboard triangle and write a PPM image.
+//! Draw an original checkerboard triangle and write a PPM image. Source: the public contract.
 mod support;
 
 use ash::vk;
@@ -13,7 +13,7 @@ use swxbx::{
     gpu::{
         graphics::{FirstDrawContract, PrimitiveTopology, VertexFormat},
         textures::{TextureContract, TextureMapping},
-        uniforms::UniformStage,
+        uniforms::GraphicsStage,
     },
 };
 
@@ -50,7 +50,7 @@ fn main() {
             index_u16: 6,
             index_u32: 7,
             cull_none: 3,
-            rgba8: 4,
+            color_formats: vec![(4, ash::vk::Format::R8G8B8A8_UNORM)],
             target_2d: 5,
             identity_swizzle: [0; 4],
             depth_raster: None,
@@ -62,7 +62,7 @@ fn main() {
             bindings: vec![TextureMapping {
                 stage: 5,
                 index: 3,
-                target: UniformStage::Fragment,
+                target: GraphicsStage::Fragment,
                 set: 1,
                 image: 0,
                 sampler: 1,

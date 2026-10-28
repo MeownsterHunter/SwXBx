@@ -1,4 +1,4 @@
-//! Host memory and synthetic shader markers for the examples.
+//! Original host memory and synthetic shader markers for the triangle example.
 use std::{ffi::c_void, fs, path::Path, process::Command, sync::Mutex, time::Instant};
 use swxbx::{functions, Host, Instance, Registers, ShaderStage, ShaderTranslator, Status};
 
@@ -94,7 +94,7 @@ pub(super) struct Shaders {
 
 impl ShaderTranslator for Shaders {
     fn translate(&self, _: ShaderStage, bytes: &[u8]) -> Result<Vec<u32>, String> {
-        // These markers identify synthetic GLSL, not hardware instruction bytes.
+        // These markers identify original GLSL, not hardware instruction bytes.
         match bytes.first() {
             Some(1) => Ok(self.vertex.clone()),
             Some(2) => Ok(self.fragment.clone()),
@@ -104,13 +104,13 @@ impl ShaderTranslator for Shaders {
 }
 
 pub(super) fn register_marker(memory: &Memory, address: usize, marker: u8) {
-    // Synthetic envelope with a marker header and nonzero payload.
+    // Observed envelope only, with an original marker header and nonzero payload.
     // The example hook never interprets this as a compiled hardware program.
     let mut bytes = [0; 0xa0];
     bytes[..4].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
     bytes[0x30] = marker;
     bytes[0x80..0x88].fill(0x5a);
-    // The program ends at an unconditional branch to itself.
+    // The program ends at an unconditional branch to itself (the public contract).
     bytes[0x98..].copy_from_slice(&0xe240_0fff_ff87_000f_u64.to_le_bytes());
     put(memory, address, &bytes);
 }

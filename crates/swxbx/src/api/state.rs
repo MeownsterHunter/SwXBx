@@ -1,5 +1,6 @@
 //! State objects: blend, channel mask, colour, depth-stencil, polygon,
 //! multisample, vertex attribute and vertex stream state.
+//! Signatures: docs/signatures/0003-objects.md.
 //!
 //! The settings are recorded as the program gave them, under the setting's
 //! name (the function name without the kind prefix and "Set"). What each

@@ -1,4 +1,4 @@
-//! Vulkan backing for the flat address space.
+//! Vulkan backing for the flat address space. Source: the public contract.-flat-global-memory, 0038 and 0039.
 
 use super::commands::Submission;
 use super::Context;
@@ -134,6 +134,15 @@ pub struct TransferStatistics {
     pub inspected: u64,
 }
 
+/// Why host access to pool storage was not granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolFault {
+    /// The pool is not registered, or the range does not lie inside it.
+    UnknownRange,
+    /// Waiting for device access to the range failed.
+    WaitFailed,
+}
+
 /// One buffer and one stable device address for every live guest pool.
 /// Methods require exclusive access, including across queue submission and readback.
 /// Raw external submissions must finish before host access or release. Backend
@@ -157,19 +166,27 @@ pub struct GlobalMemory {
 }
 
 /// The write count at which each arena page last changed. A write with no
-/// known range raises the floor, which every page then reports.
+/// known range raises the floor, which every page then reports. Each group of
+/// `GROUP_PAGES` pages also holds its newest page stamp, so a reader whose
+/// range saw no write since its count learns that from the groups alone.
 struct WriteStamps {
     count: Cell<u64>,
     floor: Cell<u64>,
     pages: RefCell<Vec<u64>>,
+    groups: RefCell<Vec<u64>>,
 }
+
+/// Pages summarized by one group stamp.
+const GROUP_PAGES: usize = 64;
 
 impl WriteStamps {
     fn new(size: u64) -> Self {
+        let pages = size.div_ceil(PAGE_SIZE) as usize;
         Self {
             count: Cell::new(0),
             floor: Cell::new(0),
-            pages: RefCell::new(vec![0; size.div_ceil(PAGE_SIZE) as usize]),
+            pages: RefCell::new(vec![0; pages]),
+            groups: RefCell::new(vec![0; pages.div_ceil(GROUP_PAGES)]),
         }
     }
 
@@ -185,23 +202,38 @@ impl WriteStamps {
     fn range(&self, range: Range<u64>) {
         let count = self.next();
         let mut pages = self.pages.borrow_mut();
-        let pages = Self::span(&mut pages, range);
-        pages.fill(count);
+        let span = Self::span(pages.len(), range);
+        pages[span.clone()].fill(count);
+        if !span.is_empty() {
+            self.groups.borrow_mut()[span.start / GROUP_PAGES..=(span.end - 1) / GROUP_PAGES]
+                .fill(count);
+        }
     }
 
     fn unwritten_since(&self, range: Range<u64>, count: u64) -> bool {
-        let mut pages = self.pages.borrow_mut();
-        self.floor.get() <= count
-            && Self::span(&mut pages, range)
-                .iter()
-                .all(|&page| page <= count)
+        if self.floor.get() > count {
+            return false;
+        }
+        let pages = self.pages.borrow();
+        let groups = self.groups.borrow();
+        let span = Self::span(pages.len(), range);
+        let mut start = span.start;
+        while start < span.end {
+            let group = start / GROUP_PAGES;
+            let end = ((group + 1) * GROUP_PAGES).min(span.end);
+            if groups[group] > count && pages[start..end].iter().any(|&page| page > count) {
+                return false;
+            }
+            start = end;
+        }
+        true
     }
 
     /// The pages a byte range touches, clipped to the arena.
-    fn span(pages: &mut [u64], range: Range<u64>) -> &mut [u64] {
-        let end = (range.end.div_ceil(PAGE_SIZE) as usize).min(pages.len());
+    fn span(pages: usize, range: Range<u64>) -> Range<usize> {
+        let end = (range.end.div_ceil(PAGE_SIZE) as usize).min(pages);
         let start = ((range.start / PAGE_SIZE) as usize).min(end);
-        &mut pages[start..end]
+        start..end
     }
 }
 
@@ -345,28 +377,32 @@ impl GlobalMemory {
         self.revision.get().is_some() && self.writes.unwritten_since(range, count)
     }
 
-    /// Cumulative transfer payload and inspection counts.
+    /// Cumulative transfer payload and legacy inspection counts.
     pub fn transfer_statistics(&self) -> TransferStatistics {
         self.statistics
     }
 
     pub(crate) fn notify_storage_write(&mut self, address: u64, size: u64) {
+        for (key, offset, bytes) in self.pool_spans(address, size) {
+            let _ = self.notify_host_write(key, offset, bytes);
+        }
+    }
+
+    /// The pools a guest address range falls in, as pool key, offset in the
+    /// pool and bytes.
+    pub(crate) fn pool_spans(&self, address: u64, size: u64) -> Vec<(u64, u64, u64)> {
         let Some(end) = address.checked_add(size) else {
-            return;
+            return Vec::new();
         };
-        let pools: Vec<_> = self
-            .allocator
+        self.allocator
             .pools
             .iter()
-            .map(|(&key, &pool)| (key, pool))
-            .collect();
-        for (key, pool) in pools {
-            let start = address.max(pool.storage);
-            let limit = end.min(pool.storage + pool.size);
-            if start < limit {
-                let _ = self.notify_host_write(key, start - pool.storage, limit - start);
-            }
-        }
+            .filter_map(|(&key, pool)| {
+                let start = address.max(pool.storage);
+                let limit = end.min(pool.storage + pool.size);
+                (start < limit).then(|| (key, start - pool.storage, limit - start))
+            })
+            .collect()
     }
 
     pub(crate) fn track_submissions(&mut self) {
@@ -423,18 +459,35 @@ impl GlobalMemory {
     /// The pointer is valid until the last alias is released. Host callbacks must
     /// use this backing. Before each host access call wait_pool; before a host
     /// write also call notify_host_write. Do not access it during submission.
-    pub unsafe fn map_pool(&mut self, key: u64) -> Option<*mut u8> {
-        let pool = *self.allocator.pools.get(&key)?;
-        self.wait_range(pool.offset..pool.offset + pool.size, true)?;
-        self.pools.get_mut(&pool.block)?.direct = true;
+    pub unsafe fn map_pool(&mut self, key: u64) -> Result<*mut u8, PoolFault> {
+        let pool = *self
+            .allocator
+            .pools
+            .get(&key)
+            .ok_or(PoolFault::UnknownRange)?;
+        self.wait_range(pool.offset..pool.offset + pool.size, true)
+            .ok_or(PoolFault::WaitFailed)?;
+        self.pools
+            .get_mut(&pool.block)
+            .ok_or(PoolFault::UnknownRange)?
+            .direct = true;
         self.host_dirty.remove(pool.offset..pool.offset + pool.size);
-        Some(unsafe { (self.mapped as *mut u8).add(pool.offset as usize) })
+        Ok(unsafe { (self.mapped as *mut u8).add(pool.offset as usize) })
     }
 
     /// Wait for submissions that overlap a host access. Writes also wait for readers.
-    pub fn wait_pool(&self, key: u64, offset: u64, size: usize, write: bool) -> Option<()> {
-        let at = self.pool_offset(key, offset, size)?;
+    pub fn wait_pool(
+        &self,
+        key: u64,
+        offset: u64,
+        size: usize,
+        write: bool,
+    ) -> Result<(), PoolFault> {
+        let at = self
+            .pool_offset(key, offset, size)
+            .ok_or(PoolFault::UnknownRange)?;
         self.wait_range(at..at + size as u64, write)
+            .ok_or(PoolFault::WaitFailed)
     }
 
     fn wait_range(&self, range: Range<u64>, write: bool) -> Option<()> {
@@ -509,7 +562,7 @@ impl GlobalMemory {
         &self.context
     }
 
-    /// A bounded uniform descriptor for a live pool.
+    /// A bounded uniform descriptor for a live pool. Evidence: the public contract.
     /// The caller retains this arena and pool until descriptor users finish.
     pub fn uniform_buffer_info(
         &self,
@@ -703,7 +756,7 @@ impl GlobalMemory {
         Some(())
     }
 
-    /// Upload dirty pages. Hosts without write notifications use bounded reads.
+    /// Upload dirty pages. Legacy hosts are inspected for changes through bounded reads.
     /// Failed callbacks retain the unfinished ranges for retry.
     pub fn upload(&mut self, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> bool {
         let mut scratch = Vec::new();
@@ -774,7 +827,9 @@ impl GlobalMemory {
     }
 
     /// Download declared device writes after only their overlapping completions.
-    /// Direct mappings need completion but no copy. External raw submissions must
+    /// Direct mappings need neither: the host reads them in place and waits
+    /// with `wait_pool` first, as `map_pool` requires, and the pending
+    /// accesses that wait checks stay recorded. External raw submissions must
     /// be completed by their caller before using an untracked arena.
     pub fn download(&mut self, mut write: impl FnMut(u64, &[u8]) -> bool) -> bool {
         for (range, storage, block) in self.live_ranges() {
@@ -784,6 +839,10 @@ impl GlobalMemory {
                 vec![range.clone()]
             };
             for dirty in ranges {
+                if self.pools[&block].direct {
+                    self.device_dirty.borrow_mut().remove(dirty);
+                    continue;
+                }
                 #[cfg(feature = "draw-metrics")]
                 let wait_span = crate::draw_metrics::PipelineSpan::new(15);
                 if self.wait_range(dirty.clone(), false).is_none() {
@@ -791,27 +850,23 @@ impl GlobalMemory {
                 }
                 #[cfg(feature = "draw-metrics")]
                 drop(wait_span);
-                if !self.pools[&block].direct {
-                    let mut at = dirty.start;
-                    while at < dirty.end {
-                        let end = (at + 64 * 1024).min(dirty.end);
-                        #[cfg(feature = "draw-metrics")]
-                        let _span = crate::draw_metrics::PipelineSpan::new(16);
-                        let bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                (self.mapped as *const u8).add(at as usize),
-                                (end - at) as usize,
-                            )
-                        };
-                        if !write(storage + at - range.start, bytes) {
-                            return false;
-                        }
-                        self.statistics.downloaded += end - at;
-                        self.device_dirty.borrow_mut().remove(at..end);
-                        at = end;
+                let mut at = dirty.start;
+                while at < dirty.end {
+                    let end = (at + 64 * 1024).min(dirty.end);
+                    #[cfg(feature = "draw-metrics")]
+                    let _span = crate::draw_metrics::PipelineSpan::new(16);
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            (self.mapped as *const u8).add(at as usize),
+                            (end - at) as usize,
+                        )
+                    };
+                    if !write(storage + at - range.start, bytes) {
+                        return false;
                     }
-                } else {
-                    self.device_dirty.borrow_mut().remove(dirty);
+                    self.statistics.downloaded += end - at;
+                    self.device_dirty.borrow_mut().remove(at..end);
+                    at = end;
                 }
             }
         }

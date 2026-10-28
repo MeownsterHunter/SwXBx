@@ -32,6 +32,13 @@ The complete ABI is in [`include/swxbx.h`](include/swxbx.h). See
 adapter and [`docs/architecture.md`](docs/architecture.md) for internal
 ownership boundaries.
 
+## Version 0.2
+
+Version 0.2 expands the execution core with native graphics and compute
+pipelines, storage buffers and images, texture copies and blits, packed
+depth/stencil transfers, configurable presentation scaling, and asynchronous
+frame delivery. Shader translation remains a host-provided service.
+
 ## Build
 
 ```sh

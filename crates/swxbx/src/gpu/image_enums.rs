@@ -1,4 +1,4 @@
-//! Evidence-tagged host interpretations.
+//! Evidence-tagged host interpretations. Source: the public contract.
 use super::image_layout::{format_block, ImageContract, ImageRule, Storage};
 use crate::tiling::ImageKind;
 use ash::vk;
@@ -73,6 +73,7 @@ impl ImageEnums {
                         format: format.guest,
                         host_format: format.host,
                         kind: target.host,
+                        coordinates: super::image_layout::Coordinates::Normalized,
                         storage: storage.host,
                     });
                 }

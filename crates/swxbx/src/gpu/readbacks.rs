@@ -1,4 +1,4 @@
-//! Per-frame offscreen readback resources.
+//! Per-frame offscreen readback resources. Source: the public contract.
 
 use super::{
     commands::Commands,
@@ -66,6 +66,7 @@ impl Readbacks {
                 cmd,
                 source,
                 slot.target.info,
+                super::images::Placement::Whole,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
             slot.target.info.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
@@ -212,7 +213,7 @@ mod tests {
     fn pending_gpu_readback_can_be_polled_without_waiting() {
         let mut backend = Backend::new(1.0).expect("GPU is required");
         assert!(backend.ensure(1, 2, 2, false));
-        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 15));
+        assert!(backend.clear_color(1, [1.0, 0.0, 0.0, 1.0], 15).is_ok());
         assert!(backend.finish());
         let context = Arc::clone(backend.context());
         let mut ty =

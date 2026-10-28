@@ -1,4 +1,4 @@
-//! Pattern images sampled on the GPU and compared byte for byte.
+//! Original pattern images, sampled on the GPU and compared byte for byte. Source: the public contract., 0043.
 #![cfg(feature = "vulkan")]
 use ash::vk;
 use std::{
@@ -645,7 +645,7 @@ fn image_regions_and_blits_have_exact_pixels() {
         offset: [2, 2, 0],
         ..from
     };
-    assert!(backend.copy_region(2, 1, from, to));
+    assert!(backend.copy_region(2, 1, from, to).is_ok());
     let result = backend.readback(2).unwrap().2;
     for y in 0..2 {
         for x in 0..3 {
@@ -714,16 +714,18 @@ fn image_regions_and_blits_have_exact_pixels() {
             assert_eq!(&pixels[dst..dst + 4], &bytes[src..src + 4]);
         }
     }
-    assert!(!backend.copy_region(
-        2,
-        1,
-        ImageRegion {
-            offset: [u32::MAX, 0, 0],
-            ..from
-        },
-        to
-    ));
-    assert!(!backend.copy_region(1, 1, from, from));
+    assert!(backend
+        .copy_region(
+            2,
+            1,
+            ImageRegion {
+                offset: [u32::MAX, 0, 0],
+                ..from
+            },
+            to
+        )
+        .is_err());
+    assert!(backend.copy_region(1, 1, from, from).is_err());
 }
 
 #[test]
@@ -799,6 +801,7 @@ fn recorded_tiled_copies_and_blits_update_arena_bytes() {
                 format: 0x600,
                 host_format: vk::Format::R8G8B8A8_UINT,
                 kind: ImageKind::D2Array,
+                coordinates: swxbx::gpu::image_layout::Coordinates::Normalized,
                 storage: Storage::Tiled(tile),
             }],
         })
@@ -1400,7 +1403,7 @@ fn component_selection_distinguishes_every_source_channel() {
 fn sampler_filters_wraps_borders_and_comparison_sample_exactly() {
     use swxbx::gpu::{
         image_enums::{EnumRule, Evidence},
-        textures::{MinFilter, SamplerDescription, SamplerEnums, TextureContract},
+        textures::{MinFilter, MipFilter, SamplerDescription, SamplerEnums, TextureContract},
     };
     fn rule<T>(guest: u64, host: T) -> EnumRule<T> {
         EnumRule {
@@ -1433,14 +1436,14 @@ fn sampler_filters_wraps_borders_and_comparison_sample_exactly() {
                     11,
                     MinFilter {
                         texel: vk::Filter::NEAREST,
-                        mip: vk::SamplerMipmapMode::NEAREST,
+                        mip: MipFilter::Nearest,
                     },
                 ),
                 rule(
                     12,
                     MinFilter {
                         texel: vk::Filter::LINEAR,
-                        mip: vk::SamplerMipmapMode::LINEAR,
+                        mip: MipFilter::Linear,
                     },
                 ),
             ],

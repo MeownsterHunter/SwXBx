@@ -1,4 +1,4 @@
-//! Optional counters for the draw benchmark.
+//! Optional counters for the original draw benchmark. Source: the public contract.
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
@@ -38,7 +38,7 @@ pub(crate) fn count(index: usize) {
 
 /// Compilation stages: request, layout, modules, four subsets, link,
 /// descriptor lock, driver cache lock, completion polling, draw completion, attachment transfers, and host upload
-/// and download, download completion, and mapped reads.
+/// and download, download completion, and mapped reads. Source: the public contract.
 pub fn take_pipeline() -> [(u64, u64, u64); 17] {
     std::array::from_fn(|i| {
         (

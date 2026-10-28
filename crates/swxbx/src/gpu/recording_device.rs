@@ -1,4 +1,4 @@
-//! Owned native recording operations.
+//! Owned native recording operations. Source: the public contract.
 #![allow(clippy::too_many_arguments)]
 
 use ash::vk::{self, Handle};
@@ -102,6 +102,48 @@ impl<'a> RecordingDevice<'a> {
             command,
             std::sync::Arc::new(move |device, command| unsafe {
                 device.cmd_bind_pipeline(command, bind_point, pipeline);
+            }),
+        );
+    }
+
+    pub unsafe fn cmd_set_viewport(&self, command: vk::CommandBuffer, viewports: &[vk::Viewport]) {
+        let viewports = viewports.to_vec();
+        self.record_or_run(
+            command,
+            std::sync::Arc::new(move |device, command| unsafe {
+                device.cmd_set_viewport(command, 0, &viewports);
+            }),
+        );
+    }
+
+    pub unsafe fn cmd_set_scissor(&self, command: vk::CommandBuffer, scissors: &[vk::Rect2D]) {
+        let scissors = scissors.to_vec();
+        self.record_or_run(
+            command,
+            std::sync::Arc::new(move |device, command| unsafe {
+                device.cmd_set_scissor(command, 0, &scissors);
+            }),
+        );
+    }
+
+    pub unsafe fn cmd_draw(
+        &self,
+        command: vk::CommandBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) {
+        self.record_or_run(
+            command,
+            std::sync::Arc::new(move |device, command| unsafe {
+                device.cmd_draw(
+                    command,
+                    vertex_count,
+                    instance_count,
+                    first_vertex,
+                    first_instance,
+                );
             }),
         );
     }

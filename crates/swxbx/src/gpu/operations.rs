@@ -1,4 +1,4 @@
-//! Explicit command hypotheses and synchronized arena operations.
+//! Explicit command hypotheses and synchronized arena operations. Source: the public contract.
 use super::{commands::Commands, pipelines::ComputePipeline, Context, GlobalMemory};
 use ash::vk;
 use std::{collections::HashMap, sync::Arc};
@@ -7,6 +7,17 @@ use std::{collections::HashMap, sync::Arc};
 #[derive(Clone, Debug)]
 pub struct ComputeBufferMapping {
     /// Recorded binding index at the selected compute stage.
+    pub index: u64,
+    /// Reflected descriptor set.
+    pub set: u32,
+    /// Reflected descriptor binding.
+    pub binding: u32,
+}
+
+/// Host interpretation of a recorded texel-buffer binding for compute.
+#[derive(Clone, Debug)]
+pub struct ComputeTexelBufferMapping {
+    /// Recorded texture handle at the compute stage.
     pub index: u64,
     /// Reflected descriptor set.
     pub set: u32,
@@ -28,6 +39,11 @@ pub struct CommandContract {
     pub compute_stage: u64,
     /// Explicit binding-to-descriptor mappings.
     pub compute_buffers: Vec<ComputeBufferMapping>,
+    /// Explicit texture-handle-to-texel-buffer descriptor mappings.
+    pub compute_texel_buffers: Vec<ComputeTexelBufferMapping>,
+    /// Base index for compute bindless-handle words, encoded as
+    /// `base + (constant_buffer_bank << 16 | byte_offset)`.
+    pub compute_texel_location_base: Option<u64>,
     /// Unresolved clear record decoder, absent by default.
     pub clear: Option<ClearDecoder>,
 }
@@ -38,6 +54,16 @@ impl CommandContract {
                 self.compute_buffers[..i]
                     .iter()
                     .all(|b| a.index != b.index && (a.set, a.binding) != (b.set, b.binding))
+            })
+            && self.compute_texel_buffers.iter().enumerate().all(|(i, a)| {
+                self.compute_texel_buffers[..i]
+                    .iter()
+                    .all(|b| a.index != b.index && (a.set, a.binding) != (b.set, b.binding))
+            })
+            && self.compute_texel_location_base.is_none_or(|base| {
+                self.compute_texel_buffers
+                    .iter()
+                    .all(|mapping| !(base..base.saturating_add(1 << 24)).contains(&mapping.index))
             })
     }
 }
@@ -217,7 +243,8 @@ impl Execution {
     }
 
     /// Write one counter report to `region` after every earlier submission
-    /// on the queue. The timer is read when the report is processed.
+    /// on the queue. The timer is read when the report is processed, as the
+    /// Maxwell command processor does in the reference host. Source: the public contract.
     pub fn report(
         &mut self,
         memory: &GlobalMemory,
@@ -263,6 +290,8 @@ impl Execution {
             requires_subgroup_size_32,
             resources,
             &[],
+            &[],
+            &[],
             groups,
             indirect,
         )
@@ -278,6 +307,8 @@ impl Execution {
         requires_subgroup_size_32: bool,
         resources: &[(u32, u32, vk::DescriptorBufferInfo)],
         images: &[(u32, u32, vk::ImageView)],
+        sampled: &[(u32, u32, vk::DescriptorImageInfo)],
+        texels: &[(u32, u32, vk::Buffer, u64, u64, vk::Format)],
         groups: [u32; 3],
         indirect: Option<(vk::Buffer, u64)>,
     ) -> Option<()> {
@@ -299,7 +330,7 @@ impl Execution {
             p
         };
         let bindings = pipeline.bindings();
-        if bindings.len() != resources.len() + images.len()
+        if resources.len() + images.len() + sampled.len() + texels.len() > bindings.len()
             || bindings.iter().any(|b| {
                 b.count != 1
                     || match b.descriptor_type {
@@ -308,6 +339,11 @@ impl Execution {
                         }
                         vk::DescriptorType::STORAGE_IMAGE => {
                             !images.iter().any(|r| (r.0, r.1) == (b.set, b.binding))
+                        }
+                        vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::SAMPLER => false,
+                        vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+                            !texels.iter().any(|r| (r.0, r.1) == (b.set, b.binding))
                         }
                         _ => true,
                     }
@@ -340,6 +376,21 @@ impl Execution {
                     .ok()?
             }
         };
+        let views: Vec<_> = texels
+            .iter()
+            .map(|r| unsafe {
+                device
+                    .create_buffer_view(
+                        &vk::BufferViewCreateInfo::default()
+                            .buffer(r.2)
+                            .format(r.5)
+                            .offset(r.3)
+                            .range(r.4),
+                        None,
+                    )
+                    .ok()
+            })
+            .collect::<Option<_>>()?;
         let result = (|| {
             let sets = if layouts.is_empty() {
                 Vec::new()
@@ -373,10 +424,57 @@ impl Execution {
                     );
                 }
             }
-            for b in bindings
-                .iter()
-                .filter(|b| b.descriptor_type != vk::DescriptorType::STORAGE_IMAGE)
-            {
+            for b in bindings.iter().filter(|b| {
+                matches!(
+                    b.descriptor_type,
+                    vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::SAMPLER
+                )
+            }) {
+                let Some(r) = sampled.iter().find(|r| (r.0, r.1) == (b.set, b.binding)) else {
+                    continue;
+                };
+                unsafe {
+                    device.update_descriptor_sets(
+                        &[vk::WriteDescriptorSet::default()
+                            .dst_set(sets[b.set as usize])
+                            .dst_binding(b.binding)
+                            .descriptor_type(b.descriptor_type)
+                            .image_info(std::slice::from_ref(&r.2))],
+                        &[],
+                    );
+                }
+            }
+            for b in bindings.iter().filter(|b| {
+                matches!(
+                    b.descriptor_type,
+                    vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                )
+            }) {
+                let at = texels
+                    .iter()
+                    .position(|r| (r.0, r.1) == (b.set, b.binding))?;
+                unsafe {
+                    device.update_descriptor_sets(
+                        &[vk::WriteDescriptorSet::default()
+                            .dst_set(sets[b.set as usize])
+                            .dst_binding(b.binding)
+                            .descriptor_type(b.descriptor_type)
+                            .texel_buffer_view(std::slice::from_ref(&views[at]))],
+                        &[],
+                    );
+                }
+            }
+            for b in bindings.iter().filter(|b| {
+                !matches!(
+                    b.descriptor_type,
+                    vk::DescriptorType::STORAGE_IMAGE
+                        | vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                )
+            }) {
                 let r = resources
                     .iter()
                     .find(|r| (r.0, r.1) == (b.set, b.binding))?;
@@ -406,10 +504,16 @@ impl Execution {
             }
             self.submit(command)?;
             let submission = self.commands.submission()?;
-            for b in bindings
-                .iter()
-                .filter(|b| b.descriptor_type != vk::DescriptorType::STORAGE_IMAGE)
-            {
+            for b in bindings.iter().filter(|b| {
+                !matches!(
+                    b.descriptor_type,
+                    vk::DescriptorType::STORAGE_IMAGE
+                        | vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                )
+            }) {
                 let info = &resources
                     .iter()
                     .find(|r| (r.0, r.1) == (b.set, b.binding))?
@@ -425,6 +529,14 @@ impl Execution {
             if super::memory::physical_writes(words) {
                 memory.submitted_all(true, submission.clone());
             }
+            for (index, r) in texels.iter().enumerate() {
+                let writable = bindings.iter().any(|b| {
+                    (b.set, b.binding) == (r.0, r.1)
+                        && b.descriptor_type == vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                });
+                memory.submitted(r.3, r.4, writable, submission.clone());
+                let _ = views[index];
+            }
             if let Some((_, at)) = indirect {
                 memory.submitted(at, 12, false, submission);
             }
@@ -436,6 +548,9 @@ impl Execution {
                 let _ = self.commands.wait();
             }
             device.destroy_descriptor_pool(pool, None);
+            for view in views {
+                device.destroy_buffer_view(view, None);
+            }
         }
         result
     }

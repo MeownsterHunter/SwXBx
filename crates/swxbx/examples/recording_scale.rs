@@ -1,4 +1,4 @@
-//! Synthetic recording and ordered clear workload.
+//! Synthetic recording and ordered clear workload. Source: the public contract.
 use std::{
     ffi::c_void,
     sync::{

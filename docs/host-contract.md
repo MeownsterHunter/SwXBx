@@ -52,9 +52,11 @@ not cross this interface.
 ## Presentation
 
 For native presentation, the host supplies required Vulkan instance extension
-names, a surface-creation callback, and current drawable dimensions. The host
-owns the window; SwXBx owns the returned surface. Callbacks must not reenter
-the instance.
+names, a surface-creation callback, current drawable dimensions, and a scaling
+callback. The scaling callback must select either stretch or fit on every
+present. Fit also supplies a positive, finite aspect ratio. SwXBx rejects an
+unwritten or invalid scaling result. The host owns the window; SwXBx owns the
+returned surface. Callbacks must not reenter the instance.
 
 For callback presentation, the host receives immutable RGBA bytes. Those bytes
 remain valid only until the callback returns. The event loop should call

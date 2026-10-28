@@ -1,4 +1,4 @@
-//! Bounded owned pipeline requests.
+//! Bounded owned pipeline requests. Evidence: the public contract, 0027, 0037, and 0038.
 /// Cumulative request reuse and insertion counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -239,7 +239,7 @@ impl<K: Eq + std::hash::Hash + Clone + Send + 'static, P: Send + Sync + 'static>
         Ok(request)
     }
 
-    /// Forget only a failed request. Existing handles retain their result.
+    /// Forget only a failed request. Existing handles retain their original result.
     #[cfg(feature = "vulkan")]
     pub fn retry_failed(&mut self, program: &K) -> bool {
         if self
