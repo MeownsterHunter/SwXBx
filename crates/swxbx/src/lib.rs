@@ -254,6 +254,15 @@ pub extern "C" fn swxbx_host_interface_version() -> u32 {
     ffi_guard(0, || HOST_INTERFACE_VERSION)
 }
 
+/// Compressed texture families the module accepts natively.
+pub const CAPABILITY_BC67_COMPRESSION: u64 = 1 << 0;
+
+/// Stable module capabilities that hosts can use before creating an instance.
+#[no_mangle]
+pub extern "C" fn swxbx_capabilities() -> u64 {
+    ffi_guard(0, || CAPABILITY_BC67_COMPRESSION)
+}
+
 /// Number of functions in the table. Valid function ids are `0..count`.
 #[no_mangle]
 pub extern "C" fn swxbx_function_count() -> u32 {
@@ -793,6 +802,7 @@ mod tests {
         let version = unsafe { CStr::from_ptr(swxbx_version()) };
         assert_eq!(version.to_str(), Ok(env!("CARGO_PKG_VERSION")));
         assert_eq!(swxbx_host_interface_version(), HOST_INTERFACE_VERSION);
+        assert_eq!(swxbx_capabilities(), CAPABILITY_BC67_COMPRESSION);
     }
 
     #[test]

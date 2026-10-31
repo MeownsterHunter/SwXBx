@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SwXbx capability contract</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 50rem; margin: 2rem auto; padding: 0 1rem; color: #18202a; }
+    code { background: #eef2f6; padding: .1rem .3rem; }
+  </style>
+</head>
+<body>
+  <h1>Capability contract</h1>
+  <p>Call <code>swxbx_capabilities()</code> before instance creation. Each set
+  bit states a stable input family that the module accepts natively.</p>
+  <h2>BC6 and BC7 compression</h2>
+  <p><code>SWXBX_CAPABILITY_BC67_COMPRESSION</code> means the host should pass
+  BC6 and BC7 blocks through unchanged. The module validates the selected
+  device when the texture is created and returns an explicit unsupported
+  result if that device cannot sample the requested format.</p>
+</body>
+</html>

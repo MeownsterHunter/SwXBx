@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 #define SWXBX_HOST_INTERFACE_VERSION 6u
+#define SWXBX_CAPABILITY_BC67_COMPRESSION (UINT64_C(1) << 0)
 
 /* Returned by lookups for a name the library does not know. */
 #define SWXBX_FUNCTION_NONE UINT32_MAX
@@ -126,6 +127,9 @@ const char *swxbx_version(void);
 /* Host interface version the library was built with. A host compares it with
  * SWXBX_HOST_INTERFACE_VERSION and refuses to continue when they differ. */
 uint32_t swxbx_host_interface_version(void);
+
+/* Stable module capabilities available before instance creation. */
+uint64_t swxbx_capabilities(void);
 
 /* The function table. Valid ids are 0 .. count-1. */
 uint32_t swxbx_function_count(void);
